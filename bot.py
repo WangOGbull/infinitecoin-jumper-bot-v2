@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import base58
+import asyncio
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -185,8 +186,11 @@ def api_claim():
 @app.route("/setup-webhook")
 def setup_webhook():
     try:
-        telegram_app.bot.delete_webhook(drop_pending_updates=True)
-        telegram_app.bot.set_webhook(url=BASE_URL + "/webhook")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+        result = loop.run_until_complete(telegram_app.bot.set_webhook(url=BASE_URL + "/webhook"))
+        loop.close()
         return jsonify({"success": True, "message": "Webhook configured!"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -208,5 +212,4 @@ if __name__ == "__main__":
         exit(1)
     init_bot()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
-# Initialize bot for Gunicorn
 init_bot()
