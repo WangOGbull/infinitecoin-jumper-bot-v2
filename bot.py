@@ -208,3 +208,5 @@ if __name__ == "__main__":
         exit(1)
     init_bot()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
+# Initialize bot for Gunicorn
+init_bot()
