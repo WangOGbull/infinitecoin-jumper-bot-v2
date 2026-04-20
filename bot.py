@@ -227,7 +227,7 @@ def api_claim():
 @app.route("/setup-webhook")
 def setup_webhook():
     u = BASE + "/webhook"
-    tg("deleteWebhook")
+    tg("deleteWebhook", {})
     r = tg("setWebhook", {"url": u})
     if r.get("ok"):
         return jsonify({"success": True, "message": "Webhook configured!"})
