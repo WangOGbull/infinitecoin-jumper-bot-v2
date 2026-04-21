@@ -563,7 +563,8 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
-    telegram_app.initialize()
+    import asyncio
+asyncio.run(telegram_app.initialize())
 
 # Initialize bot immediately so it works with Gunicorn
 if not BOT_TOKEN:
