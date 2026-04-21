@@ -1,9 +1,1 @@
-flask==3.0.0
-flask-cors==4.0.0
-gunicorn==21.2.0
-requests==2.31.0
-python-telegram-bot==20.7
-solana==0.34.2
-solders==0.21.0
-base58==2.1.1
-httpx==0.25.2
+python-telegram-bot==21.10
