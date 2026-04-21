@@ -1,12 +1,13 @@
 """
-Infinitecoin Jumper Bot - Pure Requests (no dependency conflicts)
+Infinitecoin Jumper Bot - Compatible solana/solders versions
 Features: $2 min balance check, 24hr escrow, daily bonus (500 IFC free)
-Env vars: TELEGRAM_BOT_TOKEN, BASE_URL, GAME_URL, IFC_MINT_ADDRESS, TREASURY_PRIVATE_KEY, SOLANA_RPC_URL
 """
 import os, json, logging, base58, time, requests
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -24,8 +25,6 @@ IFC_PRICE_USD = 0.01
 MIN_IFC_BALANCE = int(MIN_BALANCE_USD / IFC_PRICE_USD)
 ESCROW_HOURS = 24
 DAILY_BONUS_AMOUNT = 500
-
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
@@ -49,43 +48,23 @@ try:
     from solders.keypair import Keypair
     from spl.token.instructions import transfer_checked, TransferCheckedParams, get_associated_token_address, create_associated_token_account, CreateAssociatedTokenAccountParams
     from spl.token.constants import TOKEN_PROGRAM_ID
-    
+
     escrow_ready = bool(TREASURY_KEY)
     if escrow_ready:
         solana_client = Client(SOLANA_RPC)
         mint_pubkey = Pubkey.from_string(IFC_MINT)
         treasury_kp = Keypair.from_bytes(base58.b58decode(TREASURY_KEY))
         treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
-        logger.info(f"Escrow LIVE - treasury: {treasury_kp.pubkey()}")
+        logger.info("Escrow LIVE")
     else:
         logger.info("Escrow DEMO - set TREASURY_PRIVATE_KEY for live mode")
 except ImportError as e:
     logger.info(f"Solana libs not installed: {e}")
-    escrow_ready = False
 except Exception as e:
     logger.error(f"Escrow init failed: {e}")
-    escrow_ready = False
 
-# ========== TELEGRAM API HELPERS ==========
-def tg(method, payload=None):
-    try:
-        r = requests.post(f"{TELEGRAM_API}/{method}", json=payload or {}, timeout=30)
-        return r.json()
-    except Exception as e:
-        logger.error(f"Telegram API error: {e}")
-        return {"ok": False}
-
-def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg("sendMessage", payload)
-
-def answer_callback(query_id, text=None):
-    payload = {"callback_query_id": query_id}
-    if text:
-        payload["text"] = text
-    return tg("answerCallbackQuery", payload)
+# Bot application
+telegram_app = None
 
 # ========== DATABASE ==========
 def get_db(user_id):
@@ -105,12 +84,14 @@ def get_wallet_balance(wallet_address):
     if not escrow_ready:
         return 0
     try:
+        from spl.token.instructions import get_associated_token_address
         recipient_pk = Pubkey.from_string(wallet_address)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
         resp = solana_client.get_account_info_json_parsed(recipient_ata)
-        if resp.value and resp.value.data and resp.value.data.parsed:
-            info = resp.value.data.parsed.get("info", {})
-            return float(info.get("tokenAmount", {}).get("uiAmount", 0))
+        if resp.value and hasattr(resp.value, 'data'):
+            parsed = resp.value.data.parsed
+            if parsed and 'info' in parsed:
+                return float(parsed['info']['tokenAmount']['uiAmount'])
         return 0
     except Exception as e:
         logger.error(f"Balance check error: {e}")
@@ -123,14 +104,11 @@ def has_minimum_balance(wallet_address):
 
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
-        logger.info(f"DEMO transfer: {amount} IFC to {recipient[:10]}...")
         return {"success": True, "tx": f"demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", "message": "Demo mode - transfer simulated"}
     try:
-        logger.info(f"Transferring {amount} IFC to {recipient[:10]}...")
         recipient_pk = Pubkey.from_string(recipient)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
         if not solana_client.get_account_info(recipient_ata).value:
-            logger.info(f"Creating ATA for {recipient[:10]}...")
             tx = Transaction()
             tx.add(create_associated_token_account(CreateAssociatedTokenAccountParams(
                 payer=treasury_kp.pubkey(), owner=recipient_pk, mint=mint_pubkey,
@@ -144,7 +122,6 @@ def transfer_ifc(recipient, amount):
         tx = Transaction()
         tx.add(ix)
         result = solana_client.send_transaction(tx, treasury_kp)
-        logger.info(f"Transfer success: {result.value}")
         return {"success": True, "tx": str(result.value), "message": f"{amount:,} IFC sent!"}
     except Exception as e:
         logger.error(f"Transfer error: {e}")
@@ -193,19 +170,18 @@ def get_daily_remaining_text(uid):
     mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
     return f"{hours}h {mins}m"
 
-# ========== COMMAND HANDLERS ==========
-def handle_start(data):
-    chat = data["chat"]["id"]
-    user = data["from"]["id"]
-    uid = str(user)
+# ========== TELEGRAM HANDLERS ==========
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = str(user.id)
     _, e, esc, _ = get_db(uid)
-    wallet = user_db.get(uid, {}).get("wallet", "")
+    wallet = user_db.get(uid, {}).get("wallet")
     wallet_text = f"`{wallet[:4]}...{wallet[-4]}`" if wallet else "*Not connected*"
-    
-    lines = [
-        "*Infinitecoin Jumper*",
-        "_Collect coins. Avoid viruses. Earn IFC._",
-        "",
+
+    status_lines = [
+        f"*Infinitecoin Jumper*",
+        f"_Collect coins. Avoid viruses. Earn IFC._",
+        f"",
         f"Wallet: {wallet_text}",
         f"Earned: {e['total_earned']:,} IFC",
         f"Unclaimed: {e['unclaimed']:,} IFC",
@@ -213,62 +189,78 @@ def handle_start(data):
     if is_escrow_active(uid):
         esc_data = escrow_db.get(uid, {})
         remaining = get_escrow_remaining_hours(uid)
-        lines.append(f"Escrow: {esc_data.get('amount', 0):,} IFC ({remaining:.1f}h left)")
-    lines.extend([
-        "",
-        "/play - Launch game",
-        "/wallet - Connect Phantom",
-        "/balance - Check IFC & balance",
-        "/claim - Claim IFC",
-        "/daily - Daily bonus (500 IFC)",
-        "/help - How to play",
+        status_lines.append(f"Escrow: {esc_data.get('amount', 0):,} IFC ({remaining:.1f}h left)")
+    status_lines.extend([
+        f"",
+        f"/play - Launch game",
+        f"/wallet - Connect Phantom",
+        f"/balance - Check IFC & balance",
+        f"/claim - Claim IFC",
+        f"/daily - Daily bonus (500 IFC)",
+        f"/help - How to play",
     ])
-    
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "Play Game", "url": f"{GAME_URL}?user_id={uid}"}],
-            [{"text": "Connect Wallet", "callback_data": "wallet"}],
-        ]
-    }
-    send_message(chat, "\n".join(lines), reply_markup=keyboard)
 
-def handle_play(data):
-    chat = data["chat"]["id"]
-    uid = str(data["from"]["id"])
-    keyboard = {"inline_keyboard": [[{"text": "Open Game", "url": f"{GAME_URL}?user_id={uid}"}]]}
-    send_message(chat, "Launch Infinitecoin Jumper:", reply_markup=keyboard)
+    await update.message.reply_text(
+        "\n".join(status_lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Play Game", url=f"{GAME_URL}?user_id={uid}")],
+            [InlineKeyboardButton("Connect Wallet", callback_data="wallet")],
+        ])
+    )
 
-def handle_wallet(data):
-    chat = data["chat"]["id"]
-    uid = str(data["from"]["id"])
-    existing = get_db(uid)[0].get("wallet", "")
+async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    await update.message.reply_text("Launch Infinitecoin Jumper:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Open Game", url=f"{GAME_URL}?user_id={uid}")]
+        ]))
+
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    existing = get_db(uid)[0].get("wallet")
     if existing:
-        send_message(chat, f"Wallet connected: `{existing[:4]}...{existing[-4]}`\nUse /balance to check your IFC balance or /claim to withdraw.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"Wallet connected: `{existing[:4]}...{existing[-4]}`\n"
+            f"Use /balance to check your IFC balance or /claim to withdraw.",
+            parse_mode="Markdown"
+        )
         return
     phantom_url = f"https://phantom.app/ul/v1/connect?app_url={BASE_URL}&redirect_link={BASE_URL}/wallet-callback?user_id={uid}"
-    keyboard = {"inline_keyboard": [[{"text": "Open Phantom", "url": phantom_url}]]}
-    send_message(chat, "*Connect Phantom Wallet*\n1. Tap Open Phantom\n2. Approve connection\n3. Return to bot\n\nOr manually: `/setwallet YOUR_ADDRESS`", reply_markup=keyboard)
+    await update.message.reply_text(
+        "*Connect Phantom Wallet*\n"
+        "1. Tap Open Phantom\n"
+        "2. Approve connection\n"
+        "3. Return to bot\n\n"
+        "Or manually: `/setwallet YOUR_ADDRESS`",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Open Phantom", url=phantom_url)],
+        ])
+    )
 
-def handle_setwallet(data, args):
-    chat = data["chat"]["id"]
-    uid = str(data["from"]["id"])
-    if not args:
-        send_message(chat, "Usage: `/setwallet YOUR_SOLANA_ADDRESS`")
+async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage: `/setwallet YOUR_SOLANA_ADDRESS`", parse_mode="Markdown")
         return
-    wallet = args[0].strip()
+    wallet = context.args[0].strip()
     if len(wallet) < 32:
-        send_message(chat, "Invalid address. Must be 32-44 characters.")
+        await update.message.reply_text("Invalid address. Must be 32-44 characters.")
         return
-    user_db[uid]["wallet"] = wallet
-    send_message(chat, f"Wallet saved: `{wallet[:4]}...{wallet[-4]}`\nNow you can /claim or check /balance!", parse_mode="Markdown")
+    user_db.setdefault(uid, {})["wallet"] = wallet
+    await update.message.reply_text(
+        f"Wallet saved: `{wallet[:4]}...{wallet[-4]}`\n"
+        f"Now you can /claim or check /balance!",
+        parse_mode="Markdown"
+    )
 
-def handle_balance(data):
-    chat = data["chat"]["id"]
-    uid = str(data["from"]["id"])
-    wallet = get_db(uid)[0].get("wallet", "")
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    wallet = get_db(uid)[0].get("wallet")
     e = get_db(uid)[1]
     esc = get_db(uid)[2]
-    
+
     lines = ["*Your IFC Status*"]
     if wallet:
         lines.append(f"Wallet: `{wallet[:4]}...{wallet[-4]}`")
@@ -290,186 +282,143 @@ def handle_balance(data):
         lines.append(f"Escrow: {esc['amount']:,} IFC (ready to release!)")
     lines.append(f"\nDaily Bonus: {get_daily_remaining_text(uid)}")
     lines.append(f"\n/play to earn more!")
-    send_message(chat, "\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-def handle_claim(data):
-    chat = data["chat"]["id"]
-    uid = str(data["from"]["id"])
-    wallet = get_db(uid)[0].get("wallet", "")
+async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    wallet = get_db(uid)[0].get("wallet")
     e = get_db(uid)[1]
     esc = get_db(uid)[2]
-    
+
     if not wallet:
-        send_message(chat, "No wallet! Use /wallet first.")
+        await update.message.reply_text("No wallet! Use /wallet first.")
         return
-    
+
     if is_escrow_active(uid):
         remaining = get_escrow_remaining_hours(uid)
-        send_message(chat, f"Escrow Active\nAmount: {esc['amount']:,} IFC\nTime remaining: {remaining:.1f} hours\n\nFund your wallet with ${MIN_BALANCE_USD} worth of IFC and try again after the hold period.")
+        await update.message.reply_text(
+            f"Escrow Active\nAmount: {esc['amount']:,} IFC\nTime remaining: {remaining:.1f} hours\n\n"
+            f"Fund your wallet with ${MIN_BALANCE_USD} worth of IFC and try again.")
         return
-    
+
     if not is_escrow_active(uid) and esc['amount'] > 0 and not esc['released']:
         bal_info = has_minimum_balance(wallet)
         if bal_info['has_min']:
             total = esc['amount'] + e['unclaimed']
             if total <= 0:
-                send_message(chat, "No IFC to claim.")
+                await update.message.reply_text("No IFC to claim.")
                 return
             result = transfer_ifc(wallet, total)
             if result['success']:
                 e['total_claimed'] += total
                 e['unclaimed'] = 0
                 clear_escrow(uid)
-            send_message(chat, f"{'Released' if result['success'] else 'Failed'}: {result.get('message', '')}\nAmount: {total:,} IFC (includes escrow)\nTx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"{'Released' if result['success'] else 'Failed'}: {result.get('message', '')}\n"
+                f"Amount: {total:,} IFC\nTx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
             return
         else:
             total = esc['amount'] + e['unclaimed']
             if total > 0:
                 start_escrow(uid, total)
                 e['unclaimed'] = 0
-            send_message(chat, f"Insufficient Balance\nYour balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})\nRequired: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})\n\nYour claim ({total:,} IFC) has been held in escrow for 24 hours.\nFund your wallet and try again.")
+            await update.message.reply_text(
+                f"Insufficient Balance\n"
+                f"Your balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})\n"
+                f"Required: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})\n\n"
+                f"Your claim ({total:,} IFC) has been held in escrow for 24 hours.")
             return
-    
+
     if e['unclaimed'] <= 0:
-        send_message(chat, "No IFC to claim. /play to earn more!")
+        await update.message.reply_text("No IFC to claim. /play to earn more!")
         return
-    
+
     bal_info = has_minimum_balance(wallet)
     if not bal_info['has_min']:
         start_escrow(uid, e['unclaimed'])
         e['unclaimed'] = 0
-        send_message(chat, f"Claim Held in Escrow\nYour balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})\nRequired: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})\n\nYour claim ({escrow_db[uid]['amount']:,} IFC) is held for {ESCROW_HOURS} hours.\nFund your wallet with ${MIN_BALANCE_USD} worth of IFC and click /claim again after {ESCROW_HOURS}h.")
+        await update.message.reply_text(
+            f"Claim Held in Escrow\n"
+            f"Your balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})\n"
+            f"Required: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})\n\n"
+            f"Your claim ({escrow_db[uid]['amount']:,} IFC) is held for {ESCROW_HOURS} hours.")
         return
-    
+
     result = transfer_ifc(wallet, e['unclaimed'])
     if result['success']:
         e['total_claimed'] += e['unclaimed']
         e['unclaimed'] = 0
-    send_message(chat, f"{'Claimed' if result['success'] else 'Failed'}: {result.get('message', '')}\nTx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"{'Claimed' if result['success'] else 'Failed'}: {result.get('message', '')}\n"
+        f"Tx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
 
-def handle_daily(data):
-    chat = data["chat"]["id"]
-    uid = str(data["from"]["id"])
-    wallet = get_db(uid)[0].get("wallet", "")
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    wallet = get_db(uid)[0].get("wallet")
     e = get_db(uid)[1]
-    
+
     if not is_daily_available(uid):
         remaining = get_daily_remaining_text(uid)
-        send_message(chat, f"Daily bonus on cooldown.\nNext bonus available in: {remaining}\nCome back in 24 hours!")
+        await update.message.reply_text(
+            f"Daily bonus on cooldown.\nNext bonus available in: {remaining}\nCome back in 24 hours!")
         return
-    
+
     daily_bonus_db[uid] = int(time.time() * 1000)
-    
-    # Transfer 500 IFC from treasury to player wallet
-    tx_result = {"success": False, "message": "No wallet"}
-    if wallet:
-        tx_result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT)
-        if tx_result.get('success'):
-            e['total_earned'] += DAILY_BONUS_AMOUNT
-            e['total_claimed'] += DAILY_BONUS_AMOUNT
+
+    tx_result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False, "message": "No wallet"}
+    if tx_result.get('success'):
+        e['total_earned'] += DAILY_BONUS_AMOUNT
+        e['total_claimed'] += DAILY_BONUS_AMOUNT
+        await update.message.reply_text(
+            f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} IFC sent to your wallet!\n"
+            f"Tx: `{tx_result.get('tx', 'N/A')}`\n\nNext bonus in 24 hours.", parse_mode="Markdown")
     else:
-        # No wallet - add to unclaimed
         e['total_earned'] += DAILY_BONUS_AMOUNT
         e['unclaimed'] += DAILY_BONUS_AMOUNT
-    
-    msg = f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} IFC"
-    if tx_result.get('success') and wallet:
-        msg += f"\nSent to: `{wallet[:4]}...{wallet[-4]}`\nTx: `{tx_result.get('tx', 'N/A')}`"
-    else:
-        msg += f"\nAdded to your unclaimed balance.\nUse /claim to withdraw."
-    msg += "\n\nNext bonus in 24 hours."
-    
-    send_message(chat, msg, parse_mode="Markdown")
+        await update.message.reply_text(
+            f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} IFC added!\n"
+            f"({tx_result.get('message', '')})\n\nNext bonus in 24 hours.")
 
-def handle_help(data):
-    chat = data["chat"]["id"]
-    send_message(chat,
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "*How to Play*\n"
-        "Arrow keys: Move | Space: Jump (double = double jump) | P: Pause\n\n"
+        "Arrow keys: Move | Space: Jump | P: Pause\n\n"
         "*Claim System*\n"
-        f"- You need ${MIN_BALANCE_USD} worth of IFC in your wallet to claim\n"
-        f"- If you don't have enough, claims are held {ESCROW_HOURS}h in escrow\n"
-        f"- Fund your wallet and claim again to release\n"
-        f"- Daily Bonus: {DAILY_BONUS_AMOUNT} IFC FREE every 24h (no $2 needed!)\n\n"
-        "/play - Launch game\n"
-        "/wallet - Connect Phantom wallet\n"
-        "/setwallet - Manually set wallet\n"
-        "/balance - Check IFC and wallet balance\n"
-        "/claim - Claim IFC (needs $2 balance)\n"
-        "/daily - Free daily bonus\n"
-        "/help - Show this help"
+        f"- You need ${MIN_BALANCE_USD} worth of IFC to claim\n"
+        f"- If under, claims are held {ESCROW_HOURS}h in escrow\n"
+        f"- Daily Bonus: {DAILY_BONUS_AMOUNT} IFC FREE every 24h\n\n"
+        "/play - Launch game\n/wallet - Connect wallet\n"
+        "/setwallet - Manually set wallet\n/balance - Check balance\n"
+        "/claim - Claim IFC\n/daily - Free daily bonus\n/help - This help"
     )
 
-def handle_callback(data):
-    query_id = data["id"]
-    from_user = data["from"]["id"]
-    callback_data = data.get("data", "")
-    
-    answer_callback(query_id)
-    
-    if callback_data == "wallet":
-        handle_wallet({"chat": {"id": from_user}, "from": {"id": from_user}})
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "wallet":
+        await cmd_wallet(update, context)
 
 # ========== FLASK ROUTES ==========
 @app.route("/")
 def index():
-    return jsonify({
-        "bot": "Infinitecoin Jumper",
-        "escrow": "LIVE" if escrow_ready else "DEMO",
-        "escrow_ready": escrow_ready,
-        "users": len(user_db),
-        "min_balance_usd": MIN_BALANCE_USD,
-        "escrow_hours": ESCROW_HOURS,
-        "daily_bonus": DAILY_BONUS_AMOUNT
-    })
+    return jsonify({"bot": "Infinitecoin Jumper", "escrow": "LIVE" if escrow_ready else "DEMO",
+        "users": len(user_db), "min_balance_usd": MIN_BALANCE_USD})
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "users": len(user_db),
-        "escrow": "LIVE" if escrow_ready else "DEMO",
-        "escrow_ready": escrow_ready,
-        "treasury_key_set": bool(TREASURY_KEY),
-        "ifc_mint": IFC_MINT[:10] + "...",
-        "claim_system": "active"
-    })
+    return jsonify({"status": "ok", "users": len(user_db), "escrow": "LIVE" if escrow_ready else "DEMO",
+        "escrow_ready": escrow_ready, "treasury_key_set": bool(TREASURY_KEY)})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(force=True)
-        
-        if "callback_query" in data:
-            handle_callback(data["callback_query"])
-        elif "message" in data and "text" in data["message"]:
-            msg = data["message"]
-            text = msg["text"].strip()
-            parts = text.split()
-            cmd = parts[0].lower().split("@")[0]  # Remove bot username
-            args = parts[1:] if len(parts) > 1 else []
-            
-            handlers = {
-                "/start": handle_start,
-                "/play": handle_play,
-                "/wallet": handle_wallet,
-                "/setwallet": handle_setwallet,
-                "/balance": handle_balance,
-                "/claim": handle_claim,
-                "/daily": handle_daily,
-                "/help": handle_help,
-            }
-            
-            if cmd in handlers:
-                if cmd == "/setwallet":
-                    handlers[cmd](msg, args)
-                else:
-                    handlers[cmd](msg)
-        
+        update = Update.de_json(data, telegram_app.bot)
+        telegram_app.create_task(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return jsonify({"ok": True})  # Always return 200 to Telegram
+        return jsonify({"ok": False}), 200
 
 @app.route("/wallet-callback")
 def wallet_callback():
@@ -516,117 +465,101 @@ def api_earnings():
 
 @app.route("/api/claim", methods=["POST"])
 def api_claim():
-    """Process claim with $2 min balance check and escrow"""
     data = request.get_json() or {}
     uid = str(data.get("telegram_user_id", ""))
     wallet = data.get("wallet_address", "").strip()
     amount = int(data.get("amount", 0))
-    
     if not uid or not wallet or amount <= 0:
         return jsonify({"error": "Invalid parameters"}), 400
-    
     _, e, esc, _ = get_db(uid)
-    
+
     if is_escrow_active(uid):
         remaining = get_escrow_remaining_hours(uid)
-        return jsonify({"success": False, "message": f"Escrow active: {remaining:.1f}h remaining", "escrow": True, "time_remaining_hours": remaining})
-    
+        return jsonify({"success": False, "message": f"Escrow active: {remaining:.1f}h", "escrow": True})
+
     if not is_escrow_active(uid) and esc['amount'] > 0 and not esc['released']:
         bal_info = has_minimum_balance(wallet)
         if bal_info['has_min']:
             total = esc['amount'] + e['unclaimed']
             result = transfer_ifc(wallet, total)
             if result['success']:
-                e['total_claimed'] += total
-                e['unclaimed'] = 0
-                clear_escrow(uid)
+                e['total_claimed'] += total; e['unclaimed'] = 0; clear_escrow(uid)
             return jsonify(result)
         else:
             total = esc['amount'] + e['unclaimed']
-            start_escrow(uid, total)
-            e['unclaimed'] = 0
-            return jsonify({"success": False, "message": f"Insufficient balance (${bal_info['usd_value']:.2f}). Need ${MIN_BALANCE_USD}. Claim held in escrow.", "escrow": True, "balance": bal_info['balance'], "usd_value": bal_info['usd_value']})
-    
+            start_escrow(uid, total); e['unclaimed'] = 0
+            return jsonify({"success": False, "message": f"Need ${MIN_BALANCE_USD} balance. In escrow.", "escrow": True, "balance": bal_info['balance'], "usd_value": bal_info['usd_value']})
+
     bal_info = has_minimum_balance(wallet)
     if not bal_info['has_min']:
-        start_escrow(uid, e['unclaimed'])
-        e['unclaimed'] = 0
-        return jsonify({"success": False, "message": f"Insufficient balance (${bal_info['usd_value']:.2f}). You need ${MIN_BALANCE_USD} worth of IFC. Claim held in escrow for {ESCROW_HOURS}h.", "escrow": True, "balance": bal_info['balance'], "usd_value": bal_info['usd_value']})
-    
+        start_escrow(uid, e['unclaimed']); e['unclaimed'] = 0
+        return jsonify({"success": False, "message": f"Need ${MIN_BALANCE_USD}. In escrow {ESCROW_HOURS}h.", "escrow": True, "balance": bal_info['balance'], "usd_value": bal_info['usd_value']})
+
     result = transfer_ifc(wallet, amount)
     if result['success']:
-        e['total_claimed'] += amount
-        e['unclaimed'] = max(0, e['unclaimed'] - amount)
+        e['total_claimed'] += amount; e['unclaimed'] = max(0, e['unclaimed'] - amount)
     return jsonify(result)
 
 @app.route("/api/daily", methods=["POST"])
 def api_daily():
-    """Process daily bonus - Transfer 500 IFC from treasury to wallet"""
     data = request.get_json() or {}
     uid = str(data.get("telegram_user_id", ""))
     wallet = data.get("wallet_address", "").strip()
     amount = int(data.get("amount", DAILY_BONUS_AMOUNT))
-    
     if not uid:
         return jsonify({"error": "Missing user_id"}), 400
-    
     if not is_daily_available(uid):
-        return jsonify({"success": False, "message": f"Daily bonus on cooldown. Next: {get_daily_remaining_text(uid)}"})
-    
+        return jsonify({"success": False, "message": f"Cooldown. Next: {get_daily_remaining_text(uid)}"})
+
     daily_bonus_db[uid] = int(time.time() * 1000)
-    
-    # Transfer from treasury to player wallet
-    tx_result = {"success": False, "message": "No wallet"}
-    if wallet:
-        tx_result = transfer_ifc(wallet, amount)
-        if tx_result.get('success'):
-            _, e, _, _ = get_db(uid)
-            e['total_earned'] += amount
-            e['total_claimed'] += amount
+    tx_result = transfer_ifc(wallet, amount) if wallet else {"success": False}
+    if tx_result.get('success'):
+        _, e, _, _ = get_db(uid)
+        e['total_earned'] += amount; e['total_claimed'] += amount
     else:
         _, e, _, _ = get_db(uid)
-        e['total_earned'] += amount
-        e['unclaimed'] += amount
-    
-    return jsonify({
-        "success": True,
-        "message": f"+{amount} IFC sent to your wallet!" if (tx_result.get('success') and wallet) else f"+{amount} IFC added!",
-        "amount": amount,
-        "tx": tx_result.get('tx', ''),
-        "transferred": tx_result.get('success', False) and bool(wallet)
-    })
+        e['total_earned'] += amount; e['unclaimed'] += amount
+    return jsonify({"success": True, "amount": amount, "tx": tx_result.get('tx', ''), "transferred": tx_result.get('success', False)})
 
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
     wallet = user_db.get(str(uid), {}).get("wallet", "")
     _, e, esc, _ = get_db(uid)
-    result = {
-        "earned": e['total_earned'], "unclaimed": e['unclaimed'], "claimed": e['total_claimed'],
-        "escrow_active": is_escrow_active(uid),
-        "escrow_amount": esc['amount'] if not esc['released'] else 0,
-        "daily_available": is_daily_available(uid),
-        "daily_remaining": get_daily_remaining_text(uid),
-        "min_balance_usd": MIN_BALANCE_USD, "escrow_hours": ESCROW_HOURS
-    }
+    result = {"earned": e['total_earned'], "unclaimed": e['unclaimed'], "claimed": e['total_claimed'],
+        "escrow_active": is_escrow_active(uid), "escrow_amount": esc['amount'] if not esc['released'] else 0,
+        "daily_available": is_daily_available(uid), "min_balance_usd": MIN_BALANCE_USD}
     if wallet:
         bal_info = has_minimum_balance(wallet)
-        result['wallet_balance'] = bal_info['balance']
-        result['wallet_usd'] = bal_info['usd_value']
-        result['can_claim'] = bal_info['has_min']
+        result.update({"wallet_balance": bal_info['balance'], "wallet_usd": bal_info['usd_value'], "can_claim": bal_info['has_min']})
     return jsonify(result)
 
 @app.route("/setup-webhook")
 def setup_webhook():
     try:
-        requests.post(f"{TELEGRAM_API}/deleteWebhook", json={}, timeout=10)
-        result = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": f"{BASE_URL}/webhook"}, timeout=10).json()
-        return jsonify({"success": True, "message": "Webhook configured!", "result": result})
+        telegram_app.bot.delete_webhook(drop_pending_updates=True)
+        result = telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook")
+        return jsonify({"success": True, "message": "Webhook configured!"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ========== INIT ==========
+def init_bot():
+    global telegram_app
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", cmd_start))
+    telegram_app.add_handler(CommandHandler("play", cmd_play))
+    telegram_app.add_handler(CommandHandler("wallet", cmd_wallet))
+    telegram_app.add_handler(CommandHandler("setwallet", cmd_setwallet))
+    telegram_app.add_handler(CommandHandler("balance", cmd_balance))
+    telegram_app.add_handler(CommandHandler("claim", cmd_claim))
+    telegram_app.add_handler(CommandHandler("daily", cmd_daily))
+    telegram_app.add_handler(CommandHandler("help", cmd_help))
+    telegram_app.add_handler(CallbackQueryHandler(on_callback))
+    telegram_app.initialize()
+
 if __name__ == "__main__":
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!"); exit(1)
+    init_bot()
     logger.info(f"Bot starting on port {os.environ.get('PORT', 10000)}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
