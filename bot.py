@@ -46,7 +46,7 @@ try:
     from solana.transaction import Transaction
     from solders.pubkey import Pubkey
     from solders.keypair import Keypair
-    from spl.token.instructions import transfer_checked, TransferCheckedParams, get_associated_token_address, create_associated_token_account, CreateAssociatedTokenAccountParams
+    from spl.token.instructions import transfer_checked, TransferCheckedParams, get_associated_token_address, create_associated_token_account
     from spl.token.constants import TOKEN_PROGRAM_ID
 
     escrow_ready = bool(TREASURY_KEY)
