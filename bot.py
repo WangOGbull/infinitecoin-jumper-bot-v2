@@ -594,7 +594,7 @@ def api_claim():
     result = transfer_ifc(wallet, amount)
     if result['success']:
         e['total_claimed'] += amount
-        e['unclaimed"] = max(0, e["unclaimed"] - amount)
+        e['unclaimed'] = max(0, e['unclaimed'] - amount)
     return jsonify(result)
 
 @app.route("/api/daily", methods=["POST"])
