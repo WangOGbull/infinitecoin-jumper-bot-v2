@@ -53,7 +53,7 @@ try:
     from solana.transaction import Transaction
     from solders.pubkey import Pubkey
     from solders.keypair import Keypair
-    from spl.token.instructions import transfer_checked, TransferCheckedParams, get_associated_token_address, create_associated_token_account_idempotent
+    tx.add(create_associated_token_account_idempotent(     payer=treasury_kp.pubkey(),     owner=recipient_pk,     mint=mint_pubkey ))
     from spl.token.constants import TOKEN_PROGRAM_ID
 
     escrow_ready = bool(TREASURY_KEY)
