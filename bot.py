@@ -1,3 +1,10 @@
+import sys
+if sys.version_info >= (3, 14):
+    import telegram.ext._updater
+    class FakeUpdater:
+        def __init__(self, *args, **kwargs): pass
+    telegram.ext._updater.Updater = FakeUpdater
+
 """
 Infinitecoin Jumper Bot - Compatible solana/solders versions
 Features: $2 min balance check, 24hr escrow, daily bonus (500 IFC free)
@@ -46,7 +53,7 @@ try:
     from solana.transaction import Transaction
     from solders.pubkey import Pubkey
     from solders.keypair import Keypair
-    from spl.token.instructions import transfer_checked, TransferCheckedParams, get_associated_token_address, create_associated_token_account
+    from spl.token.instructions import transfer_checked, TransferCheckedParams, get_associated_token_address, create_associated_token_account_idempotent
     from spl.token.constants import TOKEN_PROGRAM_ID
 
     escrow_ready = bool(TREASURY_KEY)
@@ -110,10 +117,11 @@ def transfer_ifc(recipient, amount):
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
         if not solana_client.get_account_info(recipient_ata).value:
             tx = Transaction()
-            tx.add(create_associated_token_account(CreateAssociatedTokenAccountParams(
-                payer=treasury_kp.pubkey(), owner=recipient_pk, mint=mint_pubkey,
-                associated_token=recipient_ata, system_program=Pubkey.from_string("11111111111111111111111111111111"),
-                spl_token=TOKEN_PROGRAM_ID)))
+            tx.add(create_associated_token_account_idempotent(
+                payer=treasury_kp.pubkey(),
+                owner=recipient_pk,
+                mint=mint_pubkey
+            ))
             solana_client.send_transaction(tx, treasury_kp)
         ix = transfer_checked(TransferCheckedParams(
             program_id=TOKEN_PROGRAM_ID, source=treasury_ata, mint=mint_pubkey,
