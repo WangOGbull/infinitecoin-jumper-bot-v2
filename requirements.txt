@@ -1,8 +1,9 @@
 flask
 flask-cors
-python-telegram-bot
+python-telegram-bot>=20.0
 solana
 solders
-spl-token
+spl
 requests
 gunicorn
+nest-asyncio
