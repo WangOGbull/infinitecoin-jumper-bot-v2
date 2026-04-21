@@ -60,7 +60,7 @@ try:
     if escrow_ready:
         solana_client = Client(SOLANA_RPC)
         mint_pubkey = Pubkey.from_string(IFC_MINT)
-        treasury_kp = Keypair.from_bytes(base58.b58decode(TREASURY_KEY))
+        treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
         treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
         logger.info("Escrow LIVE")
     else:
