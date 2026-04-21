@@ -2,7 +2,7 @@
 Infinitecoin Jumper Bot - Production Ready
 Features: $2 min balance check, 24hr escrow, daily bonus (500 INFINITE free)
 """
-import os, json, logging, time, requests
+import os, json, logging, time, requests, asyncio
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # ========== CONFIG ==========
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BASE_URL = os.environ.get("BASE_URL", "https://infinitecoin-jumper-bot-v2.onrender.com").rstrip("/")
-GAME_URL = os.environ.get("GAME_URL", "https://candid-squirrel-c33256.netlify.app").rstrip("/")
+GAME_URL = os.environ.get("GAME_URL", "https://effortless-empanada-7db313.netlify.app").rstrip("/")
 IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjmpnj1fhzpump")
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -40,21 +40,59 @@ solana_client = None
 mint_pubkey = None
 treasury_kp = None
 treasury_ata = None
+create_associated_token_account_idempotent = None
+get_associated_token_address = None
+transfer_checked = None
+TransferCheckedParams = None
+TOKEN_PROGRAM_ID = None
 
 try:
     from solana.rpc.api import Client
     from solana.transaction import Transaction
     from solders.pubkey import Pubkey
     from solders.keypair import Keypair
-    from spl.token.instructions import (
-        create_associated_token_account_idempotent,
-        get_associated_token_address,
-        transfer_checked,
-        TransferCheckedParams,
-    )
-    from spl.token.constants import TOKEN_PROGRAM_ID
 
-    escrow_ready = bool(TREASURY_KEY)
+    # Handle different spl-token library versions
+    try:
+        from spl.token.instructions import (
+            create_associated_token_account_idempotent as _cati,
+            get_associated_token_address as _gata,
+            transfer_checked as _tc,
+            TransferCheckedParams as _tcp,
+        )
+        from spl.token.constants import TOKEN_PROGRAM_ID as _tpid
+        create_associated_token_account_idempotent = _cati
+        get_associated_token_address = _gata
+        transfer_checked = _tc
+        TransferCheckedParams = _tcp
+        TOKEN_PROGRAM_ID = _tpid
+    except ImportError:
+        try:
+            from spl.token._layouts import ACCOUNT_LAYOUT
+            from spl.token.client import Token
+            spl_token = Token
+        except ImportError:
+            spl_token = None
+        logger.warning("spl.token.instructions not fully available, trying fallback")
+        try:
+            from spl.token.instructions import get_associated_token_address as _gata
+            get_associated_token_address = _gata
+        except ImportError:
+            try:
+                from spl.token.core import _TokenCore
+                from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
+
+                def _gata_fallback(owner, mint):
+                    from solders.pubkey import Pubkey
+                    import hashlib
+                    seeds = [bytes(owner), bytes(ASSOCIATED_TOKEN_PROGRAM_ID), bytes(mint)]
+                    result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+                    return result[0]
+                get_associated_token_address = _gata_fallback
+            except Exception:
+                get_associated_token_address = None
+
+    escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
     if escrow_ready:
         solana_client = Client(SOLANA_RPC)
         mint_pubkey = Pubkey.from_string(IFC_MINT)
@@ -81,7 +119,7 @@ def get_db(user_id):
 
 # ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
-    if not escrow_ready:
+    if not escrow_ready or not get_associated_token_address:
         return 0
     try:
         recipient_pk = Pubkey.from_string(wallet_address)
@@ -112,31 +150,42 @@ def transfer_ifc(recipient, amount):
         recipient_pk = Pubkey.from_string(recipient)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
 
-        # Create ATA if needed
-        if not solana_client.get_account_info(recipient_ata).value:
-            tx = Transaction()
-            tx.add(create_associated_token_account_idempotent(
-                payer=treasury_kp.pubkey(),
-                owner=recipient_pk,
-                mint=mint_pubkey
-            ))
-            solana_client.send_transaction(tx, treasury_kp)
+        if create_associated_token_account_idempotent:
+            if not solana_client.get_account_info(recipient_ata).value:
+                tx = Transaction()
+                tx.add(create_associated_token_account_idempotent(
+                    payer=treasury_kp.pubkey(),
+                    owner=recipient_pk,
+                    mint=mint_pubkey
+                ))
+                solana_client.send_transaction(tx, treasury_kp)
 
-        # Transfer tokens
-        ix = transfer_checked(TransferCheckedParams(
-            program_id=TOKEN_PROGRAM_ID,
-            source=treasury_ata,
-            mint=mint_pubkey,
-            dest=recipient_ata,
-            owner=treasury_kp.pubkey(),
-            amount=int(amount * 1_000_000),
-            decimals=6,
-            signers=[]
-        ))
-        tx = Transaction()
-        tx.add(ix)
-        result = solana_client.send_transaction(tx, treasury_kp)
-        return {"success": True, "tx": str(result.value), "message": f"{amount:,} INFINITE sent!"}
+        if transfer_checked and TransferCheckedParams:
+            ix = transfer_checked(TransferCheckedParams(
+                program_id=TOKEN_PROGRAM_ID,
+                source=treasury_ata,
+                mint=mint_pubkey,
+                dest=recipient_ata,
+                owner=treasury_kp.pubkey(),
+                amount=int(amount * 1_000_000),
+                decimals=6,
+                signers=[]
+            ))
+            tx = Transaction()
+            tx.add(ix)
+            result = solana_client.send_transaction(tx, treasury_kp)
+            return {"success": True, "tx": str(result.value), "message": f"{amount:,} INFINITE sent!"}
+        else:
+            # Fallback: use spl.token client
+            token_client = Token(solana_client, mint_pubkey, TOKEN_PROGRAM_ID, treasury_kp)
+            result = token_client.transfer(
+                source=treasury_ata,
+                dest=recipient_ata,
+                owner=treasury_kp,
+                amount=int(amount * 1_000_000),
+                opts=None
+            )
+            return {"success": True, "tx": str(result), "message": f"{amount:,} INFINITE sent!"}
     except Exception as e:
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
@@ -545,7 +594,7 @@ def api_claim():
     result = transfer_ifc(wallet, amount)
     if result['success']:
         e['total_claimed'] += amount
-        e['unclaimed'] = max(0, e['unclaimed'] - amount)
+        e['unclaimed"] = max(0, e["unclaimed"] - amount)
     return jsonify(result)
 
 @app.route("/api/daily", methods=["POST"])
@@ -620,9 +669,20 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
-    telegram_app.initialize()
+    # Run async initialize in sync context
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop.run_until_complete(telegram_app.initialize())
+        else:
+            loop.run_until_complete(telegram_app.initialize())
+    except RuntimeError:
+        asyncio.run(telegram_app.initialize())
+    except Exception as e:
+        logger.warning("telegram_app.initialize() warning (bot may still work): %s", e)
 
-# Initialize bot immediately so it works with Gunicorn
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
 else:
