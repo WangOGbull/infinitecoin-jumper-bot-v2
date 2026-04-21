@@ -1,15 +1,8 @@
-import sys
-if sys.version_info >= (3, 14):
-    import telegram.ext._updater
-    class FakeUpdater:
-        def __init__(self, *args, **kwargs): pass
-    telegram.ext._updater.Updater = FakeUpdater
-
 """
-Infinitecoin Jumper Bot - Compatible solana/solders versions
-Features: $2 min balance check, 24hr escrow, daily bonus (500 IFC free)
+Infinitecoin Jumper Bot - Production Ready
+Features: $2 min balance check, 24hr escrow, daily bonus (500 INFINITE free)
 """
-import os, json, logging, base58, time, requests
+import os, json, logging, time, requests
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -53,7 +46,12 @@ try:
     from solana.transaction import Transaction
     from solders.pubkey import Pubkey
     from solders.keypair import Keypair
-    tx.add(create_associated_token_account_idempotent(     payer=treasury_kp.pubkey(),     owner=recipient_pk,     mint=mint_pubkey ))
+    from spl.token.instructions import (
+        create_associated_token_account_idempotent,
+        get_associated_token_address,
+        transfer_checked,
+        TransferCheckedParams,
+    )
     from spl.token.constants import TOKEN_PROGRAM_ID
 
     escrow_ready = bool(TREASURY_KEY)
@@ -62,28 +60,23 @@ try:
         mint_pubkey = Pubkey.from_string(IFC_MINT)
         treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
         treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
-        logger.info("Escrow LIVE")
+        logger.info("Escrow LIVE - Treasury: %s", treasury_kp.pubkey())
     else:
-        logger.info("Escrow DEMO - set TREASURY_PRIVATE_KEY for live mode")
+        logger.warning("Escrow DEMO - set TREASURY_PRIVATE_KEY for live mode")
 except ImportError as e:
-    logger.info(f"Solana libs not installed: {e}")
+    logger.error("Solana libs not installed: %s", e)
 except Exception as e:
-    logger.error(f"Escrow init failed: {e}")
+    logger.error("Escrow init failed: %s", e)
 
-# Bot application
 telegram_app = None
 
 # ========== DATABASE ==========
 def get_db(user_id):
     uid = str(user_id)
-    if uid not in user_db:
-        user_db[uid] = {}
-    if uid not in earnings_db:
-        earnings_db[uid] = {"total_earned": 0, "unclaimed": 0, "total_claimed": 0}
-    if uid not in escrow_db:
-        escrow_db[uid] = {"hold_time": 0, "amount": 0, "released": True}
-    if uid not in daily_bonus_db:
-        daily_bonus_db[uid] = 0
+    user_db.setdefault(uid, {})
+    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0})
+    escrow_db.setdefault(uid, {"hold_time": 0, "amount": 0, "released": True})
+    daily_bonus_db.setdefault(uid, 0)
     return user_db[uid], earnings_db[uid], escrow_db[uid], daily_bonus_db[uid]
 
 # ========== SOLANA FUNCTIONS ==========
@@ -91,17 +84,16 @@ def get_wallet_balance(wallet_address):
     if not escrow_ready:
         return 0
     try:
-        from spl.token.instructions import get_associated_token_address
         recipient_pk = Pubkey.from_string(wallet_address)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
         resp = solana_client.get_account_info_json_parsed(recipient_ata)
         if resp.value and hasattr(resp.value, 'data'):
             parsed = resp.value.data.parsed
             if parsed and 'info' in parsed:
-                return float(parsed['info']['tokenAmount']['uiAmount'])
+                return float(parsed['info']['tokenAmount']['uiAmount'] or 0)
         return 0
     except Exception as e:
-        logger.error(f"Balance check error: {e}")
+        logger.error("Balance check error: %s", e)
         return 0
 
 def has_minimum_balance(wallet_address):
@@ -111,10 +103,16 @@ def has_minimum_balance(wallet_address):
 
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
-        return {"success": True, "tx": f"demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", "message": "Demo mode - transfer simulated"}
+        return {
+            "success": True,
+            "tx": f"demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+            "message": "Demo mode - transfer simulated"
+        }
     try:
         recipient_pk = Pubkey.from_string(recipient)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
+
+        # Create ATA if needed
         if not solana_client.get_account_info(recipient_ata).value:
             tx = Transaction()
             tx.add(create_associated_token_account_idempotent(
@@ -123,16 +121,24 @@ def transfer_ifc(recipient, amount):
                 mint=mint_pubkey
             ))
             solana_client.send_transaction(tx, treasury_kp)
+
+        # Transfer tokens
         ix = transfer_checked(TransferCheckedParams(
-            program_id=TOKEN_PROGRAM_ID, source=treasury_ata, mint=mint_pubkey,
-            dest=recipient_ata, owner=treasury_kp.pubkey(), amount=int(amount * 1_000_000),
-            decimals=6, signers=[]))
+            program_id=TOKEN_PROGRAM_ID,
+            source=treasury_ata,
+            mint=mint_pubkey,
+            dest=recipient_ata,
+            owner=treasury_kp.pubkey(),
+            amount=int(amount * 1_000_000),
+            decimals=6,
+            signers=[]
+        ))
         tx = Transaction()
         tx.add(ix)
         result = solana_client.send_transaction(tx, treasury_kp)
-        return {"success": True, "tx": str(result.value), "message": f"{amount:,} IFC sent!"}
+        return {"success": True, "tx": str(result.value), "message": f"{amount:,} INFINITE sent!"}
     except Exception as e:
-        logger.error(f"Transfer error: {e}")
+        logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
 
 # ========== ESCROW LOGIC ==========
@@ -184,28 +190,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(user.id)
     _, e, esc, _ = get_db(uid)
     wallet = user_db.get(uid, {}).get("wallet")
-    wallet_text = f"`{wallet[:4]}...{wallet[-4]}`" if wallet else "*Not connected*"
+    wallet_text = f"`{wallet[:4]}...{wallet[-4:]}`" if wallet else "*Not connected*"
 
     status_lines = [
-        f"*Infinitecoin Jumper*",
-        f"_Collect coins. Avoid viruses. Earn IFC._",
-        f"",
+        "*Infinitecoin Jumper*",
+        "_Collect coins. Avoid viruses. Earn INFINITE._",
+        "",
         f"Wallet: {wallet_text}",
-        f"Earned: {e['total_earned']:,} IFC",
-        f"Unclaimed: {e['unclaimed']:,} IFC",
+        f"Earned: {e['total_earned']:,} INFINITE",
+        f"Unclaimed: {e['unclaimed']:,} INFINITE",
     ]
     if is_escrow_active(uid):
         esc_data = escrow_db.get(uid, {})
         remaining = get_escrow_remaining_hours(uid)
-        status_lines.append(f"Escrow: {esc_data.get('amount', 0):,} IFC ({remaining:.1f}h left)")
+        status_lines.append(f"Escrow: {esc_data.get('amount', 0):,} INFINITE ({remaining:.1f}h left)")
     status_lines.extend([
-        f"",
-        f"/play - Launch game",
-        f"/wallet - Connect Phantom",
-        f"/balance - Check IFC & balance",
-        f"/claim - Claim IFC",
-        f"/daily - Daily bonus (500 IFC)",
-        f"/help - How to play",
+        "",
+        "/play - Launch game",
+        "/wallet - Connect Phantom",
+        "/balance - Check INFINITE & balance",
+        "/claim - Claim INFINITE",
+        "/daily - Daily bonus (500 INFINITE)",
+        "/help - How to play",
     ])
 
     await update.message.reply_text(
@@ -219,18 +225,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    await update.message.reply_text("Launch Infinitecoin Jumper:",
+    await update.message.reply_text(
+        "Launch Infinitecoin Jumper:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Open Game", url=f"{GAME_URL}?user_id={uid}")]
-        ]))
+        ])
+    )
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     existing = get_db(uid)[0].get("wallet")
     if existing:
         await update.message.reply_text(
-            f"Wallet connected: `{existing[:4]}...{existing[-4]}`\n"
-            f"Use /balance to check your IFC balance or /claim to withdraw.",
+            f"Wallet connected: `{existing[:4]}...{existing[-4:]}`\n"
+            f"Use /balance to check your INFINITE balance or /claim to withdraw.",
             parse_mode="Markdown"
         )
         return
@@ -258,7 +266,7 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_db.setdefault(uid, {})["wallet"] = wallet
     await update.message.reply_text(
-        f"Wallet saved: `{wallet[:4]}...{wallet[-4]}`\n"
+        f"Wallet saved: `{wallet[:4]}...{wallet[-4:]}`\n"
         f"Now you can /claim or check /balance!",
         parse_mode="Markdown"
     )
@@ -269,27 +277,27 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     e = get_db(uid)[1]
     esc = get_db(uid)[2]
 
-    lines = ["*Your IFC Status*"]
+    lines = ["*Your INFINITE Status*"]
     if wallet:
-        lines.append(f"Wallet: `{wallet[:4]}...{wallet[-4]}`")
+        lines.append(f"Wallet: `{wallet[:4]}...{wallet[-4:]}`")
         bal_info = has_minimum_balance(wallet)
-        lines.append(f"Wallet Balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})")
-        lines.append(f"Min Required: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})")
-        lines.append(f"Status: {'Can claim' if bal_info['has_min'] else 'Need more IFC for claiming'}")
+        lines.append(f"Wallet Balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.2f})")
+        lines.append(f"Min Required: {MIN_IFC_BALANCE:,} INFINITE (${MIN_BALANCE_USD})")
+        lines.append(f"Status: {'Can claim' if bal_info['has_min'] else 'Need more INFINITE for claiming'}")
     else:
-        lines.append(f"Wallet: *Not connected*")
+        lines.append("Wallet: *Not connected*")
     lines.extend([
-        f"Earned: {e['total_earned']:,} IFC",
-        f"Unclaimed: {e['unclaimed']:,} IFC",
-        f"Claimed: {e['total_claimed']:,} IFC",
+        f"Earned: {e['total_earned']:,} INFINITE",
+        f"Unclaimed: {e['unclaimed']:,} INFINITE",
+        f"Claimed: {e['total_claimed']:,} INFINITE",
     ])
     if is_escrow_active(uid):
         remaining = get_escrow_remaining_hours(uid)
-        lines.append(f"Escrow: {esc['amount']:,} IFC ({remaining:.1f}h remaining)")
+        lines.append(f"Escrow: {esc['amount']:,} INFINITE ({remaining:.1f}h remaining)")
     elif esc['amount'] > 0 and not esc['released']:
-        lines.append(f"Escrow: {esc['amount']:,} IFC (ready to release!)")
+        lines.append(f"Escrow: {esc['amount']:,} INFINITE (ready to release!)")
     lines.append(f"\nDaily Bonus: {get_daily_remaining_text(uid)}")
-    lines.append(f"\n/play to earn more!")
+    lines.append("\n/play to earn more!")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,8 +313,8 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_escrow_active(uid):
         remaining = get_escrow_remaining_hours(uid)
         await update.message.reply_text(
-            f"Escrow Active\nAmount: {esc['amount']:,} IFC\nTime remaining: {remaining:.1f} hours\n\n"
-            f"Fund your wallet with ${MIN_BALANCE_USD} worth of IFC and try again.")
+            f"Escrow Active\nAmount: {esc['amount']:,} INFINITE\nTime remaining: {remaining:.1f} hours\n\n"
+            f"Fund your wallet with ${MIN_BALANCE_USD} worth of INFINITE and try again.")
         return
 
     if not is_escrow_active(uid) and esc['amount'] > 0 and not esc['released']:
@@ -314,7 +322,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bal_info['has_min']:
             total = esc['amount'] + e['unclaimed']
             if total <= 0:
-                await update.message.reply_text("No IFC to claim.")
+                await update.message.reply_text("No INFINITE to claim.")
                 return
             result = transfer_ifc(wallet, total)
             if result['success']:
@@ -323,7 +331,9 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 clear_escrow(uid)
             await update.message.reply_text(
                 f"{'Released' if result['success'] else 'Failed'}: {result.get('message', '')}\n"
-                f"Amount: {total:,} IFC\nTx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
+                f"Amount: {total:,} INFINITE\nTx: `{result.get('tx', 'N/A')}`",
+                parse_mode="Markdown"
+            )
             return
         else:
             total = esc['amount'] + e['unclaimed']
@@ -332,13 +342,13 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 e['unclaimed'] = 0
             await update.message.reply_text(
                 f"Insufficient Balance\n"
-                f"Your balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})\n"
-                f"Required: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})\n\n"
-                f"Your claim ({total:,} IFC) has been held in escrow for 24 hours.")
+                f"Your balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.2f})\n"
+                f"Required: {MIN_IFC_BALANCE:,} INFINITE (${MIN_BALANCE_USD})\n\n"
+                f"Your claim ({total:,} INFINITE) has been held in escrow for 24 hours.")
             return
 
     if e['unclaimed'] <= 0:
-        await update.message.reply_text("No IFC to claim. /play to earn more!")
+        await update.message.reply_text("No INFINITE to claim. /play to earn more!")
         return
 
     bal_info = has_minimum_balance(wallet)
@@ -347,9 +357,9 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         e['unclaimed'] = 0
         await update.message.reply_text(
             f"Claim Held in Escrow\n"
-            f"Your balance: {bal_info['balance']:,.2f} IFC (${bal_info['usd_value']:.2f})\n"
-            f"Required: {MIN_IFC_BALANCE:,} IFC (${MIN_BALANCE_USD})\n\n"
-            f"Your claim ({escrow_db[uid]['amount']:,} IFC) is held for {ESCROW_HOURS} hours.")
+            f"Your balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.2f})\n"
+            f"Required: {MIN_IFC_BALANCE:,} INFINITE (${MIN_BALANCE_USD})\n\n"
+            f"Your claim ({escrow_db[uid]['amount']:,} INFINITE) is held for {ESCROW_HOURS} hours.")
         return
 
     result = transfer_ifc(wallet, e['unclaimed'])
@@ -358,7 +368,9 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         e['unclaimed'] = 0
     await update.message.reply_text(
         f"{'Claimed' if result['success'] else 'Failed'}: {result.get('message', '')}\n"
-        f"Tx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
+        f"Tx: `{result.get('tx', 'N/A')}`",
+        parse_mode="Markdown"
+    )
 
 async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
@@ -378,13 +390,15 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         e['total_earned'] += DAILY_BONUS_AMOUNT
         e['total_claimed'] += DAILY_BONUS_AMOUNT
         await update.message.reply_text(
-            f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} IFC sent to your wallet!\n"
-            f"Tx: `{tx_result.get('tx', 'N/A')}`\n\nNext bonus in 24 hours.", parse_mode="Markdown")
+            f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} INFINITE sent to your wallet!\n"
+            f"Tx: `{tx_result.get('tx', 'N/A')}`\n\nNext bonus in 24 hours.",
+            parse_mode="Markdown"
+        )
     else:
         e['total_earned'] += DAILY_BONUS_AMOUNT
         e['unclaimed'] += DAILY_BONUS_AMOUNT
         await update.message.reply_text(
-            f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} IFC added!\n"
+            f"DAILY BONUS CLAIMED!\n+{DAILY_BONUS_AMOUNT:,} INFINITE added!\n"
             f"({tx_result.get('message', '')})\n\nNext bonus in 24 hours.")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,12 +406,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*How to Play*\n"
         "Arrow keys: Move | Space: Jump | P: Pause\n\n"
         "*Claim System*\n"
-        f"- You need ${MIN_BALANCE_USD} worth of IFC to claim\n"
+        f"- You need ${MIN_BALANCE_USD} worth of INFINITE to claim\n"
         f"- If under, claims are held {ESCROW_HOURS}h in escrow\n"
-        f"- Daily Bonus: {DAILY_BONUS_AMOUNT} IFC FREE every 24h\n\n"
+        f"- Daily Bonus: {DAILY_BONUS_AMOUNT} INFINITE FREE every 24h\n\n"
         "/play - Launch game\n/wallet - Connect wallet\n"
         "/setwallet - Manually set wallet\n/balance - Check balance\n"
-        "/claim - Claim IFC\n/daily - Free daily bonus\n/help - This help"
+        "/claim - Claim INFINITE\n/daily - Free daily bonus\n/help - This help"
     )
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -409,13 +423,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== FLASK ROUTES ==========
 @app.route("/")
 def index():
-    return jsonify({"bot": "Infinitecoin Jumper", "escrow": "LIVE" if escrow_ready else "DEMO",
-        "users": len(user_db), "min_balance_usd": MIN_BALANCE_USD})
+    return jsonify({
+        "bot": "Infinitecoin Jumper",
+        "escrow": "LIVE" if escrow_ready else "DEMO",
+        "users": len(user_db),
+        "min_balance_usd": MIN_BALANCE_USD
+    })
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "users": len(user_db), "escrow": "LIVE" if escrow_ready else "DEMO",
-        "escrow_ready": escrow_ready, "treasury_key_set": bool(TREASURY_KEY)})
+    return jsonify({
+        "status": "ok",
+        "users": len(user_db),
+        "escrow": "LIVE" if escrow_ready else "DEMO",
+        "escrow_ready": escrow_ready,
+        "treasury_key_set": bool(TREASURY_KEY)
+    })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -425,7 +448,7 @@ def webhook():
         telegram_app.create_task(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error("Webhook error: %s", e)
         return jsonify({"ok": False}), 200
 
 @app.route("/wallet-callback")
@@ -491,21 +514,38 @@ def api_claim():
             total = esc['amount'] + e['unclaimed']
             result = transfer_ifc(wallet, total)
             if result['success']:
-                e['total_claimed'] += total; e['unclaimed'] = 0; clear_escrow(uid)
+                e['total_claimed'] += total
+                e['unclaimed'] = 0
+                clear_escrow(uid)
             return jsonify(result)
         else:
             total = esc['amount'] + e['unclaimed']
-            start_escrow(uid, total); e['unclaimed'] = 0
-            return jsonify({"success": False, "message": f"Need ${MIN_BALANCE_USD} balance. In escrow.", "escrow": True, "balance": bal_info['balance'], "usd_value": bal_info['usd_value']})
+            start_escrow(uid, total)
+            e['unclaimed'] = 0
+            return jsonify({
+                "success": False,
+                "message": f"Need ${MIN_BALANCE_USD} balance. In escrow.",
+                "escrow": True,
+                "balance": bal_info['balance'],
+                "usd_value": bal_info['usd_value']
+            })
 
     bal_info = has_minimum_balance(wallet)
     if not bal_info['has_min']:
-        start_escrow(uid, e['unclaimed']); e['unclaimed'] = 0
-        return jsonify({"success": False, "message": f"Need ${MIN_BALANCE_USD}. In escrow {ESCROW_HOURS}h.", "escrow": True, "balance": bal_info['balance'], "usd_value": bal_info['usd_value']})
+        start_escrow(uid, e['unclaimed'])
+        e['unclaimed'] = 0
+        return jsonify({
+            "success": False,
+            "message": f"Need ${MIN_BALANCE_USD}. In escrow {ESCROW_HOURS}h.",
+            "escrow": True,
+            "balance": bal_info['balance'],
+            "usd_value": bal_info['usd_value']
+        })
 
     result = transfer_ifc(wallet, amount)
     if result['success']:
-        e['total_claimed'] += amount; e['unclaimed'] = max(0, e['unclaimed'] - amount)
+        e['total_claimed'] += amount
+        e['unclaimed'] = max(0, e['unclaimed'] - amount)
     return jsonify(result)
 
 @app.route("/api/daily", methods=["POST"])
@@ -523,22 +563,39 @@ def api_daily():
     tx_result = transfer_ifc(wallet, amount) if wallet else {"success": False}
     if tx_result.get('success'):
         _, e, _, _ = get_db(uid)
-        e['total_earned'] += amount; e['total_claimed'] += amount
+        e['total_earned'] += amount
+        e['total_claimed'] += amount
     else:
         _, e, _, _ = get_db(uid)
-        e['total_earned'] += amount; e['unclaimed'] += amount
-    return jsonify({"success": True, "amount": amount, "tx": tx_result.get('tx', ''), "transferred": tx_result.get('success', False)})
+        e['total_earned'] += amount
+        e['unclaimed'] += amount
+    return jsonify({
+        "success": True,
+        "amount": amount,
+        "tx": tx_result.get('tx', ''),
+        "transferred": tx_result.get('success', False)
+    })
 
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
     wallet = user_db.get(str(uid), {}).get("wallet", "")
     _, e, esc, _ = get_db(uid)
-    result = {"earned": e['total_earned'], "unclaimed": e['unclaimed'], "claimed": e['total_claimed'],
-        "escrow_active": is_escrow_active(uid), "escrow_amount": esc['amount'] if not esc['released'] else 0,
-        "daily_available": is_daily_available(uid), "min_balance_usd": MIN_BALANCE_USD}
+    result = {
+        "earned": e['total_earned'],
+        "unclaimed": e['unclaimed'],
+        "claimed": e['total_claimed'],
+        "escrow_active": is_escrow_active(uid),
+        "escrow_amount": esc['amount'] if not esc['released'] else 0,
+        "daily_available": is_daily_available(uid),
+        "min_balance_usd": MIN_BALANCE_USD
+    }
     if wallet:
         bal_info = has_minimum_balance(wallet)
-        result.update({"wallet_balance": bal_info['balance'], "wallet_usd": bal_info['usd_value'], "can_claim": bal_info['has_min']})
+        result.update({
+            "wallet_balance": bal_info['balance'],
+            "wallet_usd": bal_info['usd_value'],
+            "can_claim": bal_info['has_min']
+        })
     return jsonify(result)
 
 @app.route("/setup-webhook")
@@ -563,7 +620,8 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
-telegram_app.initialize()
+    telegram_app.initialize()
+
 # Initialize bot immediately so it works with Gunicorn
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
@@ -571,5 +629,5 @@ else:
     init_bot()
 
 if __name__ == "__main__":
-    logger.info(f"Bot starting on port {os.environ.get('PORT', 10000)}")
+    logger.info("Bot starting on port %s", os.environ.get('PORT', 10000))
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
