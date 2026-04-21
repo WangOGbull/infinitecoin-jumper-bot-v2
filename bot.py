@@ -557,9 +557,12 @@ def init_bot():
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
     telegram_app.initialize()
 
-if __name__ == "__main__":
-    if not BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set!"); exit(1)
+# Initialize bot immediately so it works with Gunicorn
+if not BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not set!")
+else:
     init_bot()
+
+if __name__ == "__main__":
     logger.info(f"Bot starting on port {os.environ.get('PORT', 10000)}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
