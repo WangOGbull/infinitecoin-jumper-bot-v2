@@ -1,9 +1,8 @@
 flask
 flask-cors
 python-telegram-bot>=20.0
-solana
-solders
-spl
+solana>=0.30.0
+solders>=0.18.0
+spl-token
 requests
 gunicorn
-nest-asyncio
