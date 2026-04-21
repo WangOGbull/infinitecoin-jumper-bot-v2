@@ -3,7 +3,7 @@ flask-cors==4.0.0
 gunicorn==21.2.0
 requests==2.31.0
 python-telegram-bot==20.7
-solana==0.34.2        # upgraded from 0.30.2
-solders==0.21.0       # upgraded from 0.20.0
+solana==0.34.2
+solders==0.21.0
 base58==2.1.1
-httpx==0.27.0         # pinned for compatibility
+httpx==0.27.0
