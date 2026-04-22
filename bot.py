@@ -138,6 +138,8 @@ def get_wallet_balance(wallet_address):
     if not escrow_ready or not get_associated_token_address:
         return 0
     try:
+        # Guard against missing Pubkey import
+        from solders.pubkey import Pubkey
         recipient_pk = Pubkey.from_string(wallet_address)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
         resp = solana_client.get_account_info_json_parsed(recipient_ata)
@@ -164,7 +166,8 @@ def transfer_ifc(recipient, amount):
             "message": "Demo mode - transfer simulated"
         }
     try:
-        # Try multiple Transaction import paths
+        # Import Pubkey and Transaction locally (module-level may not be available)
+        from solders.pubkey import Pubkey
         try:
             from solana.transaction import Transaction
         except ImportError:
@@ -487,19 +490,18 @@ def health():
         "escrow_ready": escrow_ready,
         "treasury_key_set": bool(TREASURY_KEY),
     })
-    
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        # Synchronous processing - no asyncio conflicts
-        telegram_app.update_queue.put_nowait(update)
+        telegram_app.create_task(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
         return jsonify({"ok": False}), 200
-      
+
 @app.route("/wallet-callback")
 def wallet_callback():
     uid = request.args.get("user_id", "")
@@ -634,7 +636,7 @@ def setup_webhook():
 # ========== INIT ==========
 def init_bot():
     global telegram_app
-    telegram_app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("play", cmd_play))
     telegram_app.add_handler(CommandHandler("wallet", cmd_wallet))
@@ -644,13 +646,12 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
-    telegram_app.add_error_handler(lambda u, c: logger.error(f"Update {u} caused error {c}"))
 
+    # Async init for Gunicorn compatibility
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(telegram_app.initialize())
-        loop.run_until_complete(telegram_app.start())
         logger.info("Bot initialized successfully")
     except Exception as e:
         logger.warning("Async init warning (bot may still work): %s", e)
@@ -662,4 +663,4 @@ else:
 
 if __name__ == "__main__":
     logger.info("Bot starting on port %s", os.environ.get('PORT', 10000))
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
