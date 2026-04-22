@@ -493,7 +493,7 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        telegram_app.process_update(update)
+        asyncio.run(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
