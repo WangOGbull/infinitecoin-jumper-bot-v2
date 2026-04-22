@@ -2,7 +2,7 @@
 Infinitecoin Jumper Bot - Production Ready
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
 """
-import os, json, logging, time, requests, asyncio
+import os, json, logging, time, requests, asyncio, threading
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -496,12 +496,8 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        # Process update with a fresh event loop (Gunicorn sync mode has none)
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(telegram_app.process_update(update))
-        finally:
-            loop.close()
+        # Schedule update processing on the permanent background loop
+        _run_async(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
@@ -632,20 +628,34 @@ def api_get_balance(uid):
 @app.route("/setup-webhook")
 def setup_webhook():
     try:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
-            result = loop.run_until_complete(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"))
-            return jsonify({"success": True, "message": "Webhook configured!"})
-        finally:
-            loop.close()
+        f1 = _run_async(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+        f1.result(timeout=10)
+        f2 = _run_async(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"))
+        f2.result(timeout=10)
+        return jsonify({"success": True, "message": "Webhook configured!"})
     except Exception as e:
         logger.error("Setup webhook error: %s", e)
         return jsonify({"error": str(e)}), 500
 
+# ========== BACKGROUND EVENT LOOP (fixes connection pool exhaustion) ==========
+_bot_loop = None
+_bot_thread = None
+
+def _start_background_loop():
+    global _bot_loop
+    _bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_bot_loop)
+    _bot_loop.run_forever()
+
+def _run_async(coro):
+    """Run an async coroutine in the background loop. Returns a Future."""
+    if _bot_loop is None:
+        raise RuntimeError("Background loop not running")
+    return asyncio.run_coroutine_threadsafe(coro, _bot_loop)
+
 # ========== INIT ==========
 def init_bot():
-    global telegram_app
+    global telegram_app, _bot_thread
     telegram_app = Application.builder().token(BOT_TOKEN).connection_pool_size(20).pool_timeout(30.0).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("play", cmd_play))
@@ -657,18 +667,22 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Async init for Gunicorn compatibility
+    # Start background thread with permanent event loop
+    _bot_thread = threading.Thread(target=_start_background_loop, daemon=True)
+    _bot_thread.start()
+
+    # Initialize bot in the background loop
+    future = _run_async(telegram_app.initialize())
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_app.initialize())
+        future.result(timeout=10)
         logger.info("Bot initialized successfully")
     except Exception as e:
-        logger.warning("Async init warning (bot may still work): %s", e)
+        logger.warning("Bot init warning: %s", e)
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
 else:
+    import threading
     init_bot()
 
 if __name__ == "__main__":
