@@ -493,12 +493,12 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        telegram_app.create_task(telegram_app.process_update(update))
+        telegram_app.update_queue.put_nowait(update)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
         return jsonify({"ok": False}), 200
-
+        
 @app.route("/wallet-callback")
 def wallet_callback():
     uid = request.args.get("user_id", "")
@@ -649,6 +649,7 @@ def init_bot():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.start())
         logger.info("Bot initialized successfully")
     except Exception as e:
         logger.warning("Async init warning (bot may still work): %s", e)
