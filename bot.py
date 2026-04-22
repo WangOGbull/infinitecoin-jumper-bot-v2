@@ -634,7 +634,7 @@ def setup_webhook():
 # ========== INIT ==========
 def init_bot():
     global telegram_app
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("play", cmd_play))
     telegram_app.add_handler(CommandHandler("wallet", cmd_wallet))
