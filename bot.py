@@ -492,9 +492,12 @@ def health():
 def webhook():
     try:
         data = request.get_json(force=True)
-        logger.info(f"Webhook received: {data.get('message', {}).get('text', 'no text')}")
+        logger.info(f"Webhook received")
         update = Update.de_json(data, telegram_app.bot)
-        asyncio.run(telegram_app.process_update(update))
+        asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update), 
+            telegram_app._loop
+        )
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
@@ -635,6 +638,7 @@ def setup_webhook():
 def init_bot():
     global telegram_app
     telegram_app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
+    telegram_app._loop = asyncio.new_event_loop()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("play", cmd_play))
     telegram_app.add_handler(CommandHandler("wallet", cmd_wallet))
