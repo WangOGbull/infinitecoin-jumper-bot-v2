@@ -496,7 +496,12 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        telegram_app.create_task(telegram_app.process_update(update))
+        # Process update with a fresh event loop (Gunicorn sync mode has none)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(telegram_app.process_update(update))
+        finally:
+            loop.close()
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
@@ -627,10 +632,15 @@ def api_get_balance(uid):
 @app.route("/setup-webhook")
 def setup_webhook():
     try:
-        telegram_app.bot.delete_webhook(drop_pending_updates=True)
-        result = telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook")
-        return jsonify({"success": True, "message": "Webhook configured!"})
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+            result = loop.run_until_complete(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"))
+            return jsonify({"success": True, "message": "Webhook configured!"})
+        finally:
+            loop.close()
     except Exception as e:
+        logger.error("Setup webhook error: %s", e)
         return jsonify({"error": str(e)}), 500
 
 # ========== INIT ==========
