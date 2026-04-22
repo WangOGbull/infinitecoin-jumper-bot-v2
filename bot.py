@@ -1,6 +1,6 @@
 """
 Infinitecoin Jumper Bot - Production Ready
-Features: $2 min balance check, 24hr escrow, daily bonus (500 INFINITE free)
+No minimum balance required for claims. Real INFINITE token transfers from treasury.
 """
 import os, json, logging, time, requests, asyncio
 from datetime import datetime, timezone
@@ -14,15 +14,14 @@ logger = logging.getLogger(__name__)
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BASE_URL = os.environ.get("BASE_URL", "https://infinitecoin-jumper-bot-v2.onrender.com").rstrip("/")
+BASE_URL = os.environ.get("BASE_URL", "https://web-production-3acec.up.railway.app").rstrip("/")
 GAME_URL = os.environ.get("GAME_URL", "https://effortless-empanada-7db313.netlify.app").rstrip("/")
 IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjmpnj1fhzpump")
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-MIN_BALANCE_USD = 2.0
-IFC_PRICE_USD = 0.01
-MIN_IFC_BALANCE = int(MIN_BALANCE_USD / IFC_PRICE_USD)
+# Token price for display only ($0.00000329 actual price)
+IFC_PRICE_USD = 0.00000329
 ESCROW_HOURS = 24
 DAILY_BONUS_AMOUNT = 500
 
@@ -34,77 +33,76 @@ earnings_db = {}
 escrow_db = {}
 daily_bonus_db = {}
 
-# ========== SOLANA ==========
+# ========== SOLANA SETUP ==========
 escrow_ready = False
 solana_client = None
 mint_pubkey = None
 treasury_kp = None
 treasury_ata = None
-create_associated_token_account_idempotent = None
-get_associated_token_address = None
-transfer_checked = None
-TransferCheckedParams = None
-TOKEN_PROGRAM_ID = None
 
-try:
-    from solana.rpc.api import Client
-    from solana.transaction import Transaction
-    from solders.pubkey import Pubkey
-    from solders.keypair import Keypair
+def _setup_solana():
+    global escrow_ready, solana_client, mint_pubkey, treasury_kp, treasury_ata
+    global create_associated_token_account_idempotent, get_associated_token_address
+    global transfer_checked, TransferCheckedParams, TOKEN_PROGRAM_ID
 
-    # Handle different spl-token library versions
+    create_associated_token_account_idempotent = None
+    get_associated_token_address = None
+    transfer_checked = None
+    TransferCheckedParams = None
+    TOKEN_PROGRAM_ID = None
+
     try:
-        from spl.token.instructions import (
-            create_associated_token_account_idempotent as _cati,
-            get_associated_token_address as _gata,
-            transfer_checked as _tc,
-            TransferCheckedParams as _tcp,
-        )
-        from spl.token.constants import TOKEN_PROGRAM_ID as _tpid
-        create_associated_token_account_idempotent = _cati
-        get_associated_token_address = _gata
-        transfer_checked = _tc
-        TransferCheckedParams = _tcp
-        TOKEN_PROGRAM_ID = _tpid
-    except ImportError:
+        from solana.rpc.api import Client
+        from solana.transaction import Transaction
+        from solders.pubkey import Pubkey
+        from solders.keypair import Keypair
+
+        # Try primary import path
         try:
-            from spl.token._layouts import ACCOUNT_LAYOUT
-            from spl.token.client import Token
-            spl_token = Token
-        except ImportError:
-            spl_token = None
-        logger.warning("spl.token.instructions not fully available, trying fallback")
-        try:
-            from spl.token.instructions import get_associated_token_address as _gata
+            from spl.token.instructions import (
+                create_associated_token_account_idempotent as _cati,
+                get_associated_token_address as _gata,
+                transfer_checked as _tc,
+                TransferCheckedParams as _tcp,
+            )
+            from spl.token.constants import TOKEN_PROGRAM_ID as _tpid
+            create_associated_token_account_idempotent = _cati
             get_associated_token_address = _gata
+            transfer_checked = _tc
+            TransferCheckedParams = _tcp
+            TOKEN_PROGRAM_ID = _tpid
+            logger.info("Solana imports loaded via spl.token.instructions")
         except ImportError:
+            logger.warning("spl.token.instructions not available, trying fallback")
             try:
                 from spl.token.core import _TokenCore
-                from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
+                from spl.token.constants import TOKEN_PROGRAM_ID as _tpid, ASSOCIATED_TOKEN_PROGRAM_ID
+                TOKEN_PROGRAM_ID = _tpid
 
                 def _gata_fallback(owner, mint):
-                    from solders.pubkey import Pubkey
-                    import hashlib
                     seeds = [bytes(owner), bytes(ASSOCIATED_TOKEN_PROGRAM_ID), bytes(mint)]
                     result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
                     return result[0]
                 get_associated_token_address = _gata_fallback
             except Exception:
-                get_associated_token_address = None
+                logger.error("Cannot load get_associated_token_address")
+                return
 
-    escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
-    if escrow_ready:
-        solana_client = Client(SOLANA_RPC)
-        mint_pubkey = Pubkey.from_string(IFC_MINT)
-        treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
-        treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
-        logger.info("Escrow LIVE - Treasury: %s", treasury_kp.pubkey())
-    else:
-        logger.warning("Escrow DEMO - set TREASURY_PRIVATE_KEY for live mode")
-except ImportError as e:
-    logger.error("Solana libs not installed: %s", e)
-except Exception as e:
-    logger.error("Escrow init failed: %s", e)
+        escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
+        if escrow_ready:
+            solana_client = Client(SOLANA_RPC)
+            mint_pubkey = Pubkey.from_string(IFC_MINT)
+            treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
+            treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
+            logger.info("ESCROW LIVE - Treasury: %s", treasury_kp.pubkey())
+        else:
+            logger.warning("ESCROW DEMO mode - set TREASURY_PRIVATE_KEY for live transfers")
+    except ImportError as e:
+        logger.error("Solana libraries not installed: %s", e)
+    except Exception as e:
+        logger.error("Solana init failed: %s", e)
+
+_setup_solana()
 
 telegram_app = None
 
@@ -135,9 +133,10 @@ def get_wallet_balance(wallet_address):
         return 0
 
 def has_minimum_balance(wallet_address):
+    """No minimum balance required - always returns True."""
     balance = get_wallet_balance(wallet_address)
     usd_value = balance * IFC_PRICE_USD
-    return {"has_min": usd_value >= MIN_BALANCE_USD, "balance": balance, "usd_value": usd_value}
+    return {"has_min": True, "balance": balance, "usd_value": usd_value}
 
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
@@ -147,20 +146,22 @@ def transfer_ifc(recipient, amount):
             "message": "Demo mode - transfer simulated"
         }
     try:
+        from solana.transaction import Transaction
         recipient_pk = Pubkey.from_string(recipient)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
 
-        if create_associated_token_account_idempotent:
-            if not solana_client.get_account_info(recipient_ata).value:
-                tx = Transaction()
-                tx.add(create_associated_token_account_idempotent(
-                    payer=treasury_kp.pubkey(),
-                    owner=recipient_pk,
-                    mint=mint_pubkey
-                ))
-                solana_client.send_transaction(tx, treasury_kp)
+        # Create recipient ATA if it doesn't exist
+        if create_associated_token_account_idempotent and not solana_client.get_account_info(recipient_ata).value:
+            tx = Transaction()
+            tx.add(create_associated_token_account_idempotent(
+                payer=treasury_kp.pubkey(),
+                owner=recipient_pk,
+                mint=mint_pubkey
+            ))
+            solana_client.send_transaction(tx, treasury_kp)
 
-        if transfer_checked and TransferCheckedParams:
+        # Transfer tokens (6 decimals)
+        if transfer_checked and TransferCheckedParams and TOKEN_PROGRAM_ID:
             ix = transfer_checked(TransferCheckedParams(
                 program_id=TOKEN_PROGRAM_ID,
                 source=treasury_ata,
@@ -176,21 +177,21 @@ def transfer_ifc(recipient, amount):
             result = solana_client.send_transaction(tx, treasury_kp)
             return {"success": True, "tx": str(result.value), "message": f"{amount:,} INFINITE sent!"}
         else:
-            # Fallback: use spl.token client
-            token_client = Token(solana_client, mint_pubkey, TOKEN_PROGRAM_ID, treasury_kp)
-            result = token_client.transfer(
+            # Fallback: raw RPC transfer (less safe but works)
+            from spl.token.client import Token
+            token = Token(solana_client, mint_pubkey, TOKEN_PROGRAM_ID, treasury_kp)
+            result = token.transfer(
                 source=treasury_ata,
                 dest=recipient_ata,
                 owner=treasury_kp,
                 amount=int(amount * 1_000_000),
-                opts=None
             )
             return {"success": True, "tx": str(result), "message": f"{amount:,} INFINITE sent!"}
     except Exception as e:
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
 
-# ========== ESCROW LOGIC ==========
+# ========== ESCROW LOGIC (time-based only, no balance gate) ==========
 def is_escrow_active(uid):
     e = escrow_db.get(str(uid), {})
     if not e or e.get("amount", 0) <= 0:
@@ -330,9 +331,8 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if wallet:
         lines.append(f"Wallet: `{wallet[:4]}...{wallet[-4:]}`")
         bal_info = has_minimum_balance(wallet)
-        lines.append(f"Wallet Balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.2f})")
-        lines.append(f"Min Required: {MIN_IFC_BALANCE:,} INFINITE (${MIN_BALANCE_USD})")
-        lines.append(f"Status: {'Can claim' if bal_info['has_min'] else 'Need more INFINITE for claiming'}")
+        lines.append(f"Wallet Balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.6f})")
+        lines.append("Status: *Ready to claim* - no minimum required!")
     else:
         lines.append("Wallet: *Not connected*")
     lines.extend([
@@ -362,55 +362,32 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_escrow_active(uid):
         remaining = get_escrow_remaining_hours(uid)
         await update.message.reply_text(
-            f"Escrow Active\nAmount: {esc['amount']:,} INFINITE\nTime remaining: {remaining:.1f} hours\n\n"
-            f"Fund your wallet with ${MIN_BALANCE_USD} worth of INFINITE and try again.")
+            f"Escrow Active\nAmount: {esc['amount']:,} INFINITE\nTime remaining: {remaining:.1f} hours")
         return
 
+    # Release from escrow if ready
     if not is_escrow_active(uid) and esc['amount'] > 0 and not esc['released']:
-        bal_info = has_minimum_balance(wallet)
-        if bal_info['has_min']:
-            total = esc['amount'] + e['unclaimed']
-            if total <= 0:
-                await update.message.reply_text("No INFINITE to claim.")
-                return
-            result = transfer_ifc(wallet, total)
-            if result['success']:
-                e['total_claimed'] += total
-                e['unclaimed'] = 0
-                clear_escrow(uid)
-            await update.message.reply_text(
-                f"{'Released' if result['success'] else 'Failed'}: {result.get('message', '')}\n"
-                f"Amount: {total:,} INFINITE\nTx: `{result.get('tx', 'N/A')}`",
-                parse_mode="Markdown"
-            )
+        total = esc['amount'] + e['unclaimed']
+        if total <= 0:
+            await update.message.reply_text("No INFINITE to claim.")
             return
-        else:
-            total = esc['amount'] + e['unclaimed']
-            if total > 0:
-                start_escrow(uid, total)
-                e['unclaimed'] = 0
-            await update.message.reply_text(
-                f"Insufficient Balance\n"
-                f"Your balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.2f})\n"
-                f"Required: {MIN_IFC_BALANCE:,} INFINITE (${MIN_BALANCE_USD})\n\n"
-                f"Your claim ({total:,} INFINITE) has been held in escrow for 24 hours.")
-            return
+        result = transfer_ifc(wallet, total)
+        if result['success']:
+            e['total_claimed'] += total
+            e['unclaimed'] = 0
+            clear_escrow(uid)
+        await update.message.reply_text(
+            f"{'Released' if result['success'] else 'Failed'}: {result.get('message', '')}\n"
+            f"Amount: {total:,} INFINITE\nTx: `{result.get('tx', 'N/A')}`",
+            parse_mode="Markdown"
+        )
+        return
 
     if e['unclaimed'] <= 0:
         await update.message.reply_text("No INFINITE to claim. /play to earn more!")
         return
 
-    bal_info = has_minimum_balance(wallet)
-    if not bal_info['has_min']:
-        start_escrow(uid, e['unclaimed'])
-        e['unclaimed'] = 0
-        await update.message.reply_text(
-            f"Claim Held in Escrow\n"
-            f"Your balance: {bal_info['balance']:,.2f} INFINITE (${bal_info['usd_value']:.2f})\n"
-            f"Required: {MIN_IFC_BALANCE:,} INFINITE (${MIN_BALANCE_USD})\n\n"
-            f"Your claim ({escrow_db[uid]['amount']:,} INFINITE) is held for {ESCROW_HOURS} hours.")
-        return
-
+    # Direct claim - no minimum balance required
     result = transfer_ifc(wallet, e['unclaimed'])
     if result['success']:
         e['total_claimed'] += e['unclaimed']
@@ -455,8 +432,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*How to Play*\n"
         "Arrow keys: Move | Space: Jump | P: Pause\n\n"
         "*Claim System*\n"
-        f"- You need ${MIN_BALANCE_USD} worth of INFINITE to claim\n"
-        f"- If under, claims are held {ESCROW_HOURS}h in escrow\n"
+        "- No minimum balance required to claim INFINITE!\n"
+        "- Connect your Phantom wallet and /claim anytime\n"
         f"- Daily Bonus: {DAILY_BONUS_AMOUNT} INFINITE FREE every 24h\n\n"
         "/play - Launch game\n/wallet - Connect wallet\n"
         "/setwallet - Manually set wallet\n/balance - Check balance\n"
@@ -476,7 +453,6 @@ def index():
         "bot": "Infinitecoin Jumper",
         "escrow": "LIVE" if escrow_ready else "DEMO",
         "users": len(user_db),
-        "min_balance_usd": MIN_BALANCE_USD
     })
 
 @app.route("/health")
@@ -486,7 +462,7 @@ def health():
         "users": len(user_db),
         "escrow": "LIVE" if escrow_ready else "DEMO",
         "escrow_ready": escrow_ready,
-        "treasury_key_set": bool(TREASURY_KEY)
+        "treasury_key_set": bool(TREASURY_KEY),
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -558,39 +534,15 @@ def api_claim():
         return jsonify({"success": False, "message": f"Escrow active: {remaining:.1f}h", "escrow": True})
 
     if not is_escrow_active(uid) and esc['amount'] > 0 and not esc['released']:
-        bal_info = has_minimum_balance(wallet)
-        if bal_info['has_min']:
-            total = esc['amount'] + e['unclaimed']
-            result = transfer_ifc(wallet, total)
-            if result['success']:
-                e['total_claimed'] += total
-                e['unclaimed'] = 0
-                clear_escrow(uid)
-            return jsonify(result)
-        else:
-            total = esc['amount'] + e['unclaimed']
-            start_escrow(uid, total)
+        total = esc['amount'] + e['unclaimed']
+        result = transfer_ifc(wallet, total)
+        if result['success']:
+            e['total_claimed'] += total
             e['unclaimed'] = 0
-            return jsonify({
-                "success": False,
-                "message": f"Need ${MIN_BALANCE_USD} balance. In escrow.",
-                "escrow": True,
-                "balance": bal_info['balance'],
-                "usd_value": bal_info['usd_value']
-            })
+            clear_escrow(uid)
+        return jsonify(result)
 
-    bal_info = has_minimum_balance(wallet)
-    if not bal_info['has_min']:
-        start_escrow(uid, e['unclaimed'])
-        e['unclaimed'] = 0
-        return jsonify({
-            "success": False,
-            "message": f"Need ${MIN_BALANCE_USD}. In escrow {ESCROW_HOURS}h.",
-            "escrow": True,
-            "balance": bal_info['balance'],
-            "usd_value": bal_info['usd_value']
-        })
-
+    # Direct claim - no minimum balance required
     result = transfer_ifc(wallet, amount)
     if result['success']:
         e['total_claimed'] += amount
@@ -636,7 +588,6 @@ def api_get_balance(uid):
         "escrow_active": is_escrow_active(uid),
         "escrow_amount": esc['amount'] if not esc['released'] else 0,
         "daily_available": is_daily_available(uid),
-        "min_balance_usd": MIN_BALANCE_USD
     }
     if wallet:
         bal_info = has_minimum_balance(wallet)
@@ -669,19 +620,15 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
-    # Run async initialize in sync context
+
+    # Async init for Gunicorn compatibility
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop.run_until_complete(telegram_app.initialize())
-        else:
-            loop.run_until_complete(telegram_app.initialize())
-    except RuntimeError:
-        asyncio.run(telegram_app.initialize())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(telegram_app.initialize())
+        logger.info("Bot initialized successfully")
     except Exception as e:
-        logger.warning("telegram_app.initialize() warning (bot may still work): %s", e)
+        logger.warning("Async init warning (bot may still work): %s", e)
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
