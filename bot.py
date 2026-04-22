@@ -487,22 +487,19 @@ def health():
         "escrow_ready": escrow_ready,
         "treasury_key_set": bool(TREASURY_KEY),
     })
-
+    
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(force=True)
-        logger.info(f"Webhook received")
         update = Update.de_json(data, telegram_app.bot)
-        asyncio.run_coroutine_threadsafe(
-            telegram_app.process_update(update), 
-            telegram_app._loop
-        )
+        # Synchronous processing - no asyncio conflicts
+        telegram_app.update_queue.put_nowait(update)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
         return jsonify({"ok": False}), 200
-        
+      
 @app.route("/wallet-callback")
 def wallet_callback():
     uid = request.args.get("user_id", "")
@@ -638,7 +635,6 @@ def setup_webhook():
 def init_bot():
     global telegram_app
     telegram_app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
-    telegram_app._loop = asyncio.new_event_loop()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("play", cmd_play))
     telegram_app.add_handler(CommandHandler("wallet", cmd_wallet))
