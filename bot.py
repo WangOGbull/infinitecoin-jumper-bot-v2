@@ -52,55 +52,73 @@ def _setup_solana():
     TOKEN_PROGRAM_ID = None
 
     try:
-        from solana.rpc.api import Client
-        from solana.transaction import Transaction
+        # Import solders first (Rust-based primitives)
         from solders.pubkey import Pubkey
         from solders.keypair import Keypair
+        logger.info("solders loaded OK")
+    except ImportError as e:
+        logger.error("solders not installed: %s", e)
+        return
 
-        # Try primary import path
+    try:
+        from solana.rpc.api import Client
+        logger.info("solana.rpc.api loaded OK")
+    except ImportError as e:
+        logger.error("solana.rpc.api not found: %s", e)
+        return
+
+    # Transaction import varies by solana version
+    try:
+        from solana.transaction import Transaction
+        logger.info("solana.transaction loaded OK")
+    except ImportError:
         try:
-            from spl.token.instructions import (
-                create_associated_token_account_idempotent as _cati,
-                get_associated_token_address as _gata,
-                transfer_checked as _tc,
-                TransferCheckedParams as _tcp,
-            )
-            from spl.token.constants import TOKEN_PROGRAM_ID as _tpid
-            create_associated_token_account_idempotent = _cati
+            from solders.transaction import Transaction
+            logger.info("solders.transaction loaded OK")
+        except ImportError as e:
+            logger.error("Transaction class not found: %s", e)
+            return
+
+    # SPL token instructions
+    try:
+        from spl.token.instructions import (
+            create_associated_token_account_idempotent as _cati,
+            get_associated_token_address as _gata,
+            transfer_checked as _tc,
+            TransferCheckedParams as _tcp,
+        )
+        from spl.token.constants import TOKEN_PROGRAM_ID as _tpid
+        create_associated_token_account_idempotent = _cati
+        get_associated_token_address = _gata
+        transfer_checked = _tc
+        TransferCheckedParams = _tcp
+        TOKEN_PROGRAM_ID = _tpid
+        logger.info("spl.token.instructions loaded OK")
+    except ImportError as e:
+        logger.warning("spl.token.instructions not available: %s", e)
+        try:
+            from spl.token.instructions import get_associated_token_address as _gata
+            from spl.token.constants import TOKEN_PROGRAM_ID as _tpid, ASSOCIATED_TOKEN_PROGRAM_ID
             get_associated_token_address = _gata
-            transfer_checked = _tc
-            TransferCheckedParams = _tcp
             TOKEN_PROGRAM_ID = _tpid
-            logger.info("Solana imports loaded via spl.token.instructions")
-        except ImportError:
-            logger.warning("spl.token.instructions not available, trying fallback")
-            try:
-                from spl.token.core import _TokenCore
-                from spl.token.constants import TOKEN_PROGRAM_ID as _tpid, ASSOCIATED_TOKEN_PROGRAM_ID
-                TOKEN_PROGRAM_ID = _tpid
+            logger.info("spl.token.constants loaded OK (partial)")
+        except ImportError as e2:
+            logger.error("Cannot load SPL token modules: %s", e2)
+            return
 
-                def _gata_fallback(owner, mint):
-                    seeds = [bytes(owner), bytes(ASSOCIATED_TOKEN_PROGRAM_ID), bytes(mint)]
-                    result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
-                    return result[0]
-                get_associated_token_address = _gata_fallback
-            except Exception:
-                logger.error("Cannot load get_associated_token_address")
-                return
-
-        escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
-        if escrow_ready:
+    escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
+    if escrow_ready:
+        try:
             solana_client = Client(SOLANA_RPC)
             mint_pubkey = Pubkey.from_string(IFC_MINT)
             treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
             treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
             logger.info("ESCROW LIVE - Treasury: %s", treasury_kp.pubkey())
-        else:
-            logger.warning("ESCROW DEMO mode - set TREASURY_PRIVATE_KEY for live transfers")
-    except ImportError as e:
-        logger.error("Solana libraries not installed: %s", e)
-    except Exception as e:
-        logger.error("Solana init failed: %s", e)
+        except Exception as e:
+            logger.error("Failed to initialize Solana client: %s", e)
+            escrow_ready = False
+    else:
+        logger.warning("ESCROW DEMO mode - set TREASURY_PRIVATE_KEY for live transfers")
 
 _setup_solana()
 
@@ -146,7 +164,12 @@ def transfer_ifc(recipient, amount):
             "message": "Demo mode - transfer simulated"
         }
     try:
-        from solana.transaction import Transaction
+        # Try multiple Transaction import paths
+        try:
+            from solana.transaction import Transaction
+        except ImportError:
+            from solders.transaction import Transaction
+
         recipient_pk = Pubkey.from_string(recipient)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
 
@@ -177,7 +200,7 @@ def transfer_ifc(recipient, amount):
             result = solana_client.send_transaction(tx, treasury_kp)
             return {"success": True, "tx": str(result.value), "message": f"{amount:,} INFINITE sent!"}
         else:
-            # Fallback: raw RPC transfer (less safe but works)
+            # Fallback: raw RPC transfer
             from spl.token.client import Token
             token = Token(solana_client, mint_pubkey, TOKEN_PROGRAM_ID, treasury_kp)
             result = token.transfer(
