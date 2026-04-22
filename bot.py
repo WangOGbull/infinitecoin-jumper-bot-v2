@@ -644,7 +644,16 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
+    telegram_app.add_error_handler(lambda u, c: logger.error(f"Update {u} caused error {c}"))
 
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.start())
+        logger.info("Bot initialized successfully")
+    except Exception as e:
+        logger.warning("Async init warning (bot may still work): %s", e)
     # Async init for Gunicorn compatibility
     try:
         loop = asyncio.new_event_loop()
