@@ -671,4 +671,4 @@ else:
 
 if __name__ == "__main__":
     logger.info("Bot starting on port %s", os.environ.get('PORT', 10000))
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=False)
