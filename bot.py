@@ -658,14 +658,6 @@ def init_bot():
         logger.info("Bot initialized successfully")
     except Exception as e:
         logger.warning("Async init warning (bot may still work): %s", e)
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_app.initialize())
-        loop.run_until_complete(telegram_app.start())
-        logger.info("Bot initialized successfully")
-    except Exception as e:
-        logger.warning("Async init warning (bot may still work): %s", e)
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
