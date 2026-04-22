@@ -493,11 +493,12 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
+        # This ensures ALL handlers (start, play, wallet, etc.) are processed
         asyncio.run(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
-        return jsonify({"ok": False}), 200
+        return jsonify({"ok": False}), 200 
         
 @app.route("/wallet-callback")
 def wallet_callback():
