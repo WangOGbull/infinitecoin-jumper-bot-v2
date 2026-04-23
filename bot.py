@@ -125,6 +125,16 @@ def _setup_solana():
             logger.error("Transaction class not found: %s", e)
             return
 
+    # Hardcoded Solana program IDs (reliable fallback when spl library fails)
+    try:
+        from solders.pubkey import Pubkey
+        TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knl")
+        logger.info("Using hardcoded Solana program IDs")
+    except Exception as e:
+        logger.error("Cannot create program IDs: %s", e)
+        return
+
     # SPL token instructions
     try:
         from spl.token.instructions import (
@@ -133,45 +143,23 @@ def _setup_solana():
             transfer_checked as _tc,
             TransferCheckedParams as _tcp,
         )
-        from spl.token.constants import TOKEN_PROGRAM_ID as _tpid
         create_associated_token_account_idempotent = _cati
         get_associated_token_address = _gata
         transfer_checked = _tc
         TransferCheckedParams = _tcp
-        TOKEN_PROGRAM_ID = _tpid
         logger.info("spl.token.instructions loaded OK")
     except ImportError as e:
         logger.warning("spl.token.instructions not available: %s", e)
-        try:
-            from spl.token.core import _TokenCore
-            from spl.token.constants import TOKEN_PROGRAM_ID as _tpid, ASSOCIATED_TOKEN_PROGRAM_ID
-            TOKEN_PROGRAM_ID = _tpid
-            logger.info("spl.token.core loaded OK")
-        except ImportError:
-            try:
-                from spl.token.constants import TOKEN_PROGRAM_ID as _tpid, ASSOCIATED_TOKEN_PROGRAM_ID
-                TOKEN_PROGRAM_ID = _tpid
-                logger.info("spl.token.constants loaded OK (partial)")
-            except ImportError as e2:
-                logger.error("Cannot load SPL token modules: %s", e2)
-                return
-        # Try to get at least get_associated_token_address
-        try:
-            from spl.token.instructions import get_associated_token_address as _gata
-            get_associated_token_address = _gata
-        except ImportError:
-            try:
-                from spl.token.core import _TokenCore
-                def _gata_fallback(owner, mint):
-                    from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
-                    seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
-                    result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
-                    return result[0]
-                get_associated_token_address = _gata_fallback
-                logger.info("Using fallback get_associated_token_address")
-            except Exception as e3:
-                logger.error("Cannot load get_associated_token_address: %s", e3)
-                return
+        # Build fallback get_associated_token_address
+        def _gata_fallback(owner, mint):
+            seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
+            result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+            return result[0]
+        get_associated_token_address = _gata_fallback
+        create_associated_token_account_idempotent = None
+        transfer_checked = None
+        TransferCheckedParams = None
+        logger.info("Using fallback get_associated_token_address")
 
     escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
     if escrow_ready:
@@ -315,13 +303,12 @@ def _create_associated_token_account_raw(owner_pubkey, mint_pubkey):
         from solders.transaction import Transaction
         from solders.message import Message
         from solders.hash import Hash
-        from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
         import requests
 
         owner = Pubkey.from_string(str(owner_pubkey))
         mint = Pubkey.from_string(str(mint_pubkey))
 
-        # Derive ATA address
+        # Derive ATA address using hardcoded program IDs
         seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
         ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
 
@@ -332,13 +319,16 @@ def _create_associated_token_account_raw(owner_pubkey, mint_pubkey):
         if check.get('result', {}).get('value'):
             return None  # Already exists
 
+        # System program ID
+        SYS_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
+
         # Build create ATA instruction
         keys = [
             AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),  # payer
             AccountMeta(pubkey=ata, is_signer=False, is_writable=True),                   # associated account
             AccountMeta(pubkey=owner, is_signer=False, is_writable=False),                # owner
             AccountMeta(pubkey=mint, is_signer=False, is_writable=False),                 # mint
-            AccountMeta(pubkey=Pubkey.from_string("11111111111111111111111111111111"), is_signer=False, is_writable=False),  # system program
+            AccountMeta(pubkey=SYS_PROGRAM, is_signer=False, is_writable=False),          # system program
             AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),     # token program
         ]
         ix = Instruction(
