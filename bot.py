@@ -168,77 +168,64 @@ def _compact_u16(value):
     return bytes(result)
 
 def _build_transaction(instructions, signer_kp, blockhash_bytes):
-    """Build a Solana transaction from raw bytes. NO external tx libraries.
+    """Build a Solana transaction from raw bytes.
     
-    Args:
-        instructions: list of (program_id_pubkey, [accounts], data_bytes)
-                     where accounts = [(pubkey, is_signer, is_writable), ...]
-        signer_kp: solders Keypair for signing
-        blockhash_bytes: 32-byte recent blockhash
-    
-    Returns:
-        base64-encoded transaction string ready for sendTransaction RPC
+    Correct Solana message format:
+    - Header: [num_signers, num_readonly_signed, num_readonly_unsigned]
+    - Account keys: sorted [writable_signers, readonly_signers, writable_unsigned, readonly_unsigned]
+    - Recent blockhash: 32 bytes
+    - Instructions: [(program_index, [account_indices], data), ...]
     """
     from solders.pubkey import Pubkey
     
-    # Collect all unique pubkeys with their meta properties
-    # Ordered: writable signers -> readonly signers -> writable non-signers -> readonly non-signers
     signer_pubkey = signer_kp.pubkey()
     
-    # Map: pubkey -> {index, is_signer, is_writable}
-    key_meta = {}
+    # Collect all pubkeys with their properties
+    key_props = {}  # pk_bytes -> (Pubkey, is_signer, is_writable)
     
     def add_key(pk, is_signer, is_writable):
         pk_bytes = bytes(pk)
-        if pk_bytes in key_meta:
-            # Merge: signer/writable are OR'd
-            key_meta[pk_bytes]['is_signer'] |= is_signer
-            key_meta[pk_bytes]['is_writable'] |= is_writable
+        if pk_bytes in key_props:
+            existing_is_s, existing_is_w = key_props[pk_bytes][1], key_props[pk_bytes][2]
+            key_props[pk_bytes] = (pk, existing_is_s or is_signer, existing_is_w or is_writable)
         else:
-            key_meta[pk_bytes] = {'pk': pk, 'is_signer': is_signer, 'is_writable': is_writable}
+            key_props[pk_bytes] = (pk, is_signer, is_writable)
     
-    # Add signer first (always a signer)
+    # Add signer (always first in sorted order)
     add_key(signer_pubkey, True, True)
     
-    # Collect keys from instructions
+    # Add all keys from instructions
     for prog_id, accounts, _ in instructions:
         for pk, is_s, is_w in accounts:
             add_key(pk, is_s, is_w)
-        add_key(prog_id, False, False)
+        # Program IDs are always non-signer, non-writable
+        if bytes(prog_id) not in key_props:
+            key_props[bytes(prog_id)] = (prog_id, False, False)
     
-    # Order keys: writable signers, readonly signers, writable non-signers, readonly non-signers
+    # Sort: writable signers → readonly signers → writable non-signers → readonly non-signers
     def sort_key(item):
-        pk_bytes, meta = item
-        is_signer = meta['is_signer']
-        is_writable = meta['is_writable']
-        # signer_priority = 0 if signer else 2
-        # writable_priority = 0 if writable else 1
+        pk_bytes, (pk, is_signer, is_writable) = item
         return (0 if is_signer else 2, 0 if is_writable else 1)
     
-    sorted_keys = sorted(key_meta.items(), key=sort_key)
+    sorted_keys = sorted(key_props.items(), key=sort_key)
     
-    # Build key list and index map
+    # Build account keys list and index map
     account_keys = []
     key_index = {}
-    for pk_bytes, meta in sorted_keys:
+    for pk_bytes, (pk, is_s, is_w) in sorted_keys:
         account_keys.append(pk_bytes)
         key_index[pk_bytes] = len(account_keys) - 1
     
-    # Count signers and readonly
-    num_signers = sum(1 for _, m in sorted_keys if m['is_signer'])
-    num_readonly_signers = sum(1 for _, m in sorted_keys if m['is_signer'] and not m['is_writable'])
-    num_readonly_non_signers = sum(1 for _, m in sorted_keys if not m['is_signer'] and not m['is_writable'])
+    # Count header values
+    num_signers = sum(1 for _, (_, is_s, _) in sorted_keys if is_s)
+    num_readonly_signed = sum(1 for _, (_, is_s, is_w) in sorted_keys if is_s and not is_w)
+    num_readonly_unsigned = sum(1 for _, (_, is_s, is_w) in sorted_keys if not is_s and not is_w)
     
     # Build message
     msg_parts = []
     
     # Header
-    header = bytes([
-        num_signers,
-        num_readonly_signers,
-        num_readonly_non_signers
-    ])
-    msg_parts.append(header)
+    msg_parts.append(bytes([num_signers, num_readonly_signed, num_readonly_unsigned]))
     
     # Account keys
     msg_parts.append(_compact_u16(len(account_keys)))
@@ -249,30 +236,21 @@ def _build_transaction(instructions, signer_kp, blockhash_bytes):
     msg_parts.append(blockhash_bytes)
     
     # Instructions
-    raw_instructions = []
+    raw_ixs = []
     for prog_id, accounts, data in instructions:
-        prog_index = key_index[bytes(prog_id)]
-        # Account indices
-        acct_indices = []
-        for pk, is_s, is_w in accounts:
-            idx = key_index[bytes(pk)]
-            # Account meta byte
-            meta_byte = idx
-            if is_s:
-                meta_byte |= 0x80
-            if is_w:
-                meta_byte |= 0x40
-            acct_indices.append(meta_byte)
+        prog_idx = key_index[bytes(prog_id)]
+        # Account indices are SIMPLE 1-byte values (no flags!)
+        acct_indices = [key_index[bytes(pk)] for pk, _, _ in accounts]
         
-        ix_bytes = bytes([prog_index])
+        ix_bytes = bytes([prog_idx])
         ix_bytes += _compact_u16(len(acct_indices))
         ix_bytes += bytes(acct_indices)
         ix_bytes += _compact_u16(len(data))
         ix_bytes += data
-        raw_instructions.append(ix_bytes)
+        raw_ixs.append(ix_bytes)
     
-    msg_parts.append(_compact_u16(len(raw_instructions)))
-    for ix in raw_instructions:
+    msg_parts.append(_compact_u16(len(raw_ixs)))
+    for ix in raw_ixs:
         msg_parts.append(ix)
     
     message_bytes = b''.join(msg_parts)
@@ -280,9 +258,8 @@ def _build_transaction(instructions, signer_kp, blockhash_bytes):
     # Sign message
     signature = signer_kp.sign_message(message_bytes)
     
-    # Transaction = [signatures] + [message]
-    sig_array = _compact_u16(1) + bytes(signature)  # 1 signature
-    tx_bytes = sig_array + message_bytes
+    # Transaction: [signatures] + [message]
+    tx_bytes = _compact_u16(1) + bytes(signature) + message_bytes
     
     return base64.b64encode(tx_bytes).decode('utf-8')
 
