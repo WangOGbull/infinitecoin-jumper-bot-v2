@@ -1,7 +1,6 @@
 """
 Infinitecoin Jumper Bot - Production Ready
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
-Uses raw bytes for ALL transaction serialization (zero library dependencies for tx building).
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct
 from datetime import datetime, timezone
@@ -109,7 +108,8 @@ def _setup_solana():
 
     # Hardcoded program IDs via from_string (works for these well-known addresses)
     TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-    ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8kn1")
+    # FIX: Corrected typo in Associated Token Program ID (was ...kn1, now ...knL)
+    ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
     logger.info("Solana program IDs loaded")
 
     # Try SPL library (may not be available)
@@ -153,129 +153,6 @@ def _setup_solana():
 
 _setup_solana()
 
-# ========== RAW SOLANA TRANSACTION BUILDER ==========
-
-def _compact_u16(value):
-    """Solana compact-u16 encoding."""
-    result = []
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        if value == 0:
-            result.append(byte)
-            break
-        result.append(byte | 0x80)
-    return bytes(result)
-
-def _build_transaction(instructions, signer_kp, blockhash_bytes):
-    """Build a Solana transaction from raw bytes.
-    
-    Correct Solana message format:
-    - Header: [num_signers, num_readonly_signed, num_readonly_unsigned]
-    - Account keys: sorted [writable_signers, readonly_signers, writable_unsigned, readonly_unsigned]
-    - Recent blockhash: 32 bytes
-    - Instructions: [(program_index, [account_indices], data), ...]
-    """
-    from solders.pubkey import Pubkey
-    
-    signer_pubkey = signer_kp.pubkey()
-    
-    # Collect all pubkeys with their properties
-    key_props = {}  # pk_bytes -> (Pubkey, is_signer, is_writable)
-    
-    def add_key(pk, is_signer, is_writable):
-        pk_bytes = bytes(pk)
-        if pk_bytes in key_props:
-            existing_is_s, existing_is_w = key_props[pk_bytes][1], key_props[pk_bytes][2]
-            key_props[pk_bytes] = (pk, existing_is_s or is_signer, existing_is_w or is_writable)
-        else:
-            key_props[pk_bytes] = (pk, is_signer, is_writable)
-    
-    # Add signer (always first in sorted order)
-    add_key(signer_pubkey, True, True)
-    
-    # Add all keys from instructions
-    for prog_id, accounts, _ in instructions:
-        for pk, is_s, is_w in accounts:
-            add_key(pk, is_s, is_w)
-        # Program IDs are always non-signer, non-writable
-        if bytes(prog_id) not in key_props:
-            key_props[bytes(prog_id)] = (prog_id, False, False)
-    
-    # Sort: writable signers → readonly signers → writable non-signers → readonly non-signers
-    def sort_key(item):
-        pk_bytes, (pk, is_signer, is_writable) = item
-        return (0 if is_signer else 2, 0 if is_writable else 1)
-    
-    sorted_keys = sorted(key_props.items(), key=sort_key)
-    
-    # Build account keys list and index map
-    account_keys = []
-    key_index = {}
-    for pk_bytes, (pk, is_s, is_w) in sorted_keys:
-        account_keys.append(pk_bytes)
-        key_index[pk_bytes] = len(account_keys) - 1
-    
-    # Count header values
-    num_signers = sum(1 for _, (_, is_s, _) in sorted_keys if is_s)
-    num_readonly_signed = sum(1 for _, (_, is_s, is_w) in sorted_keys if is_s and not is_w)
-    num_readonly_unsigned = sum(1 for _, (_, is_s, is_w) in sorted_keys if not is_s and not is_w)
-    
-    # Build message
-    msg_parts = []
-    
-    # Header
-    msg_parts.append(bytes([num_signers, num_readonly_signed, num_readonly_unsigned]))
-    
-    # Account keys
-    msg_parts.append(_compact_u16(len(account_keys)))
-    for pk_bytes in account_keys:
-        msg_parts.append(pk_bytes)
-    
-    # Recent blockhash
-    msg_parts.append(blockhash_bytes)
-    
-    # Instructions
-    raw_ixs = []
-    for prog_id, accounts, data in instructions:
-        prog_idx = key_index[bytes(prog_id)]
-        # Account indices are SIMPLE 1-byte values (no flags!)
-        acct_indices = [key_index[bytes(pk)] for pk, _, _ in accounts]
-        
-        ix_bytes = bytes([prog_idx])
-        ix_bytes += _compact_u16(len(acct_indices))
-        ix_bytes += bytes(acct_indices)
-        ix_bytes += _compact_u16(len(data))
-        ix_bytes += data
-        raw_ixs.append(ix_bytes)
-    
-    msg_parts.append(_compact_u16(len(raw_ixs)))
-    for ix in raw_ixs:
-        msg_parts.append(ix)
-    
-    message_bytes = b''.join(msg_parts)
-    
-    # Sign message
-    signature = signer_kp.sign_message(message_bytes)
-    
-    # Transaction: [signatures] + [message]
-    tx_bytes = _compact_u16(1) + bytes(signature) + message_bytes
-    
-    return base64.b64encode(tx_bytes).decode('utf-8')
-
-def _rpc_call(method, params, req_id):
-    """Make raw RPC call to Solana."""
-    resp = requests.post(SOLANA_RPC, json={
-        "jsonrpc": "2.0", "id": req_id, "method": method, "params": params
-    }, timeout=15)
-    return resp.json()
-
-def _get_blockhash():
-    """Get recent blockhash from RPC."""
-    data = _rpc_call("getLatestBlockhash", [{"commitment": "finalized"}], 1)
-    from solders.hash import Hash
-    return Hash.from_string(data['result']['value']['blockhash'])
-
 # ========== DATABASE ==========
 def get_db(user_id):
     uid = str(user_id)
@@ -306,144 +183,97 @@ def has_minimum_balance(wallet_address):
     usd_value = balance * get_token_price()
     return {"has_min": True, "balance": balance, "usd_value": usd_value}
 
-def _get_treasury_token_account():
-    """Find treasury token account with INFINITE balance via RPC."""
+# ========== REAL TOKEN TRANSFER ==========
+def transfer_ifc(recipient, amount):
+    """
+    Send real INFINITE from treasury to player.
+    Auto-creates player ATA if missing.
+    """
     if not escrow_ready:
-        return None
-    try:
-        data = _rpc_call("getTokenAccountsByOwner",
-            [str(treasury_kp.pubkey()), {"mint": IFC_MINT}, {"encoding": "jsonParsed"}], 1)
-        if 'result' in data and data['result'].get('value'):
-            for acc in data['result']['value']:
-                info = acc['account']['data']['parsed']['info']
-                bal = float(info['tokenAmount']['uiAmount'] or 0)
-                addr = acc['pubkey']
-                if bal > 0:
-                    from solders.pubkey import Pubkey
-                    logger.info("Treasury source: %s (balance: %s)", addr, bal)
-                    return Pubkey.from_string(addr)
-    except Exception as e:
-        logger.warning("Token search failed: %s", e)
-    return treasury_ata
+        return {"success": False, "tx": None, "message": "Treasury not ready"}
 
-def _make_and_send_transaction(instructions, signer_kp):
-    """Build transaction from solders instructions, sign, and send via raw RPC.
-    Uses ONLY solders types - no solana.transaction.Transaction at all."""
-    from solders.pubkey import Pubkey
-    from solders.transaction import Transaction as SoldersTx
-    from solders.message import Message
-    from solders.hash import Hash
-    import requests
-
-    # Get blockhash
-    bh_resp = requests.post(SOLANA_RPC, json={
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getLatestBlockhash",
-        "params": [{"commitment": "finalized"}]
-    }, timeout=10).json()
-    blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
-
-    # Build message and transaction using solders types only
-    msg = Message.new_with_blockhash(instructions, signer_kp.pubkey(), blockhash)
-    tx = SoldersTx([signer_kp], msg, blockhash)
-    tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
-
-    # Send via raw RPC
-    send_resp = requests.post(SOLANA_RPC, json={
-        "jsonrpc": "2.0", "id": 2,
-        "method": "sendTransaction",
-        "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3}]
-    }, timeout=15).json()
-
-    if 'result' in send_resp:
-        return {"success": True, "tx": send_resp['result']}
-    else:
-        return {"success": False, "error": send_resp.get('error', 'unknown')}
-
-def _get_or_create_ata(wallet_address):
-    """Get or create ATA. Returns ata_pubkey or None."""
     try:
         from solders.pubkey import Pubkey
         from solders.instruction import Instruction, AccountMeta
+        from solders.transaction import Transaction as SoldersTx
+        from solders.message import Message
+        from solders.hash import Hash
 
-        wallet_pk = Pubkey.from_string(wallet_address)
-        seeds = [bytes(wallet_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
-        ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
-        
-        # Check if exists
-        data = _rpc_call("getAccountInfo", [str(ata), {"encoding": "base64"}], 1)
-        if data.get('result', {}).get('value'):
-            return ata
-        
-        # Create ATA
-        sys_prog = Pubkey.from_string("11111111111111111111111111111111")
-        ix = Instruction(
-            program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-            accounts=[
-                AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),
-                AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=wallet_pk, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-            ],
-            data=b""
-        )
-        
-        result = _make_and_send_transaction([ix], treasury_kp)
-        if result['success']:
-            logger.info("Created ATA %s: %s", ata, result['tx'])
+        amount_raw = int(amount * 1_000_000)
+        recipient_pk = Pubkey.from_string(recipient.strip())
+
+        # Derive recipient ATA
+        seeds = [bytes(recipient_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
+        recipient_ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+
+        # Check if ATA exists
+        acct_info = solana_client.get_account_info(recipient_ata)
+        if hasattr(acct_info, 'value'):
+            ata_exists = acct_info.value is not None
         else:
-            logger.warning("ATA create: %s", result.get('error'))
-        return ata
-    except Exception as e:
-        logger.error("ATA error: %s", e)
-        return None
+            ata_exists = acct_info.get('result', {}).get('value') is not None
 
-def _transfer_tokens_raw(recipient_wallet, amount_int):
-    """Transfer INFINITE using solders Transaction + raw RPC."""
-    try:
-        from solders.pubkey import Pubkey
-        from solders.instruction import Instruction, AccountMeta
-        import struct
+        instructions = []
 
-        recipient_ata = _get_or_create_ata(recipient_wallet)
-        if recipient_ata is None:
-            return {"success": False, "tx": "", "message": "Cannot get recipient token account"}
+        if not ata_exists:
+            # Create ATA instruction (needs Rent sysvar too)
+            sys_prog = Pubkey.from_string("11111111111111111111111111111111")
+            rent_sysvar = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+            create_ix = Instruction(
+                program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+                accounts=[
+                    AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),
+                    AccountMeta(pubkey=recipient_ata, is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=recipient_pk, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=rent_sysvar, is_signer=False, is_writable=False),
+                ],
+                data=b""
+            )
+            instructions.append(create_ix)
 
-        source = _get_treasury_token_account()
-        if source is None:
-            return {"success": False, "tx": "", "message": "Treasury has no INFINITE"}
-
-        ix_data = struct.pack("<BQB", 12, amount_int, 6)
-        ix = Instruction(
+        # TransferChecked instruction (program index 12, 6 decimals)
+        ix_data = struct.pack("<BQB", 12, amount_raw, 6)
+        transfer_ix = Instruction(
             program_id=TOKEN_PROGRAM_ID,
             accounts=[
-                AccountMeta(pubkey=Pubkey.from_string(str(source)), is_signer=False, is_writable=True),
+                AccountMeta(pubkey=treasury_ata, is_signer=False, is_writable=True),
                 AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=Pubkey.from_string(str(recipient_ata)), is_signer=False, is_writable=True),
+                AccountMeta(pubkey=recipient_ata, is_signer=False, is_writable=True),
                 AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=False),
             ],
             data=ix_data
         )
+        instructions.append(transfer_ix)
 
-        result = _make_and_send_transaction([ix], treasury_kp)
-        if result['success']:
-            return {"success": True, "tx": result['tx'], "message": "INFINITE sent!"}
+        # Build & send via raw RPC using solders types only
+        bh_resp = requests.post(SOLANA_RPC, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{"commitment": "finalized"}]
+        }, timeout=10).json()
+        blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
+
+        msg = Message.new_with_blockhash(instructions, treasury_kp.pubkey(), blockhash)
+        tx = SoldersTx([treasury_kp], msg, blockhash)
+        tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
+
+        send_resp = requests.post(SOLANA_RPC, json={
+            "jsonrpc": "2.0", "id": 2,
+            "method": "sendTransaction",
+            "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3}]
+        }, timeout=15).json()
+
+        if 'result' in send_resp:
+            return {"success": True, "tx": send_resp['result'], "message": f"Sent {amount:,} INFINITE"}
         else:
-            return {"success": False, "tx": "", "message": f"RPC: {result.get('error', 'unknown')}"}
+            return {"success": False, "tx": None, "message": f"RPC error: {send_resp.get('error', 'unknown')}"}
+
     except Exception as e:
         logger.error("Transfer error: %s", e)
-        return {"success": False, "tx": "", "message": str(e)}
-
-def transfer_ifc(recipient, amount):
-    if not escrow_ready:
-        return {
-            "success": True,
-            "tx": f"demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-            "message": "Demo mode - transfer simulated"
-        }
-    return _transfer_tokens_raw(recipient, int(amount * 1_000_000))
+        return {"success": False, "tx": None, "message": str(e)}
 
 # ========== ESCROW LOGIC ==========
 def is_escrow_active(uid):
