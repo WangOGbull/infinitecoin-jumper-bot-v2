@@ -326,12 +326,45 @@ def _get_treasury_token_account():
         logger.warning("Token search failed: %s", e)
     return treasury_ata
 
+def _make_and_send_transaction(instructions, signer_kp):
+    """Build transaction from solders instructions, sign, and send via raw RPC.
+    Uses ONLY solders types - no solana.transaction.Transaction at all."""
+    from solders.pubkey import Pubkey
+    from solders.transaction import Transaction as SoldersTx
+    from solders.message import Message
+    from solders.hash import Hash
+    import requests
+
+    # Get blockhash
+    bh_resp = requests.post(SOLANA_RPC, json={
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getLatestBlockhash",
+        "params": [{"commitment": "finalized"}]
+    }, timeout=10).json()
+    blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
+
+    # Build message and transaction using solders types only
+    msg = Message.new_with_blockhash(instructions, signer_kp.pubkey(), blockhash)
+    tx = SoldersTx([signer_kp], msg, blockhash)
+    tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
+
+    # Send via raw RPC
+    send_resp = requests.post(SOLANA_RPC, json={
+        "jsonrpc": "2.0", "id": 2,
+        "method": "sendTransaction",
+        "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3}]
+    }, timeout=15).json()
+
+    if 'result' in send_resp:
+        return {"success": True, "tx": send_resp['result']}
+    else:
+        return {"success": False, "error": send_resp.get('error', 'unknown')}
+
 def _get_or_create_ata(wallet_address):
     """Get or create ATA. Returns ata_pubkey or None."""
     try:
         from solders.pubkey import Pubkey
         from solders.instruction import Instruction, AccountMeta
-        from solana.transaction import Transaction
 
         wallet_pk = Pubkey.from_string(wallet_address)
         seeds = [bytes(wallet_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
@@ -342,7 +375,7 @@ def _get_or_create_ata(wallet_address):
         if data.get('result', {}).get('value'):
             return ata
         
-        # Create ATA using solders Instruction (compatible with solana Transaction)
+        # Create ATA
         sys_prog = Pubkey.from_string("11111111111111111111111111111111")
         ix = Instruction(
             program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -357,21 +390,21 @@ def _get_or_create_ata(wallet_address):
             data=b""
         )
         
-        tx = Transaction()
-        tx.add(ix)
-        result = solana_client.send_transaction(tx, treasury_kp)
-        logger.info("Created ATA %s: %s", ata, result.value)
+        result = _make_and_send_transaction([ix], treasury_kp)
+        if result['success']:
+            logger.info("Created ATA %s: %s", ata, result['tx'])
+        else:
+            logger.warning("ATA create: %s", result.get('error'))
         return ata
     except Exception as e:
         logger.error("ATA error: %s", e)
         return None
 
 def _transfer_tokens_raw(recipient_wallet, amount_int):
-    """Transfer INFINITE using solders Instruction + solana Transaction."""
+    """Transfer INFINITE using solders Transaction + raw RPC."""
     try:
         from solders.pubkey import Pubkey
         from solders.instruction import Instruction, AccountMeta
-        from solana.transaction import Transaction
         import struct
 
         recipient_ata = _get_or_create_ata(recipient_wallet)
@@ -394,10 +427,11 @@ def _transfer_tokens_raw(recipient_wallet, amount_int):
             data=ix_data
         )
 
-        tx = Transaction()
-        tx.add(ix)
-        result = solana_client.send_transaction(tx, treasury_kp)
-        return {"success": True, "tx": str(result.value), "message": "INFINITE sent!"}
+        result = _make_and_send_transaction([ix], treasury_kp)
+        if result['success']:
+            return {"success": True, "tx": result['tx'], "message": "INFINITE sent!"}
+        else:
+            return {"success": False, "tx": "", "message": f"RPC: {result.get('error', 'unknown')}"}
     except Exception as e:
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
