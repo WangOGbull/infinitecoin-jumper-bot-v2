@@ -351,6 +351,9 @@ def transfer_ifc(recipient, amount):
     except Exception as e:
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
+
+# ========== ESCROW LOGIC (time-based only, no balance gate) ==========
+def is_escrow_active(uid):
     e = escrow_db.get(str(uid), {})
     if not e or e.get("amount", 0) <= 0:
         return False
