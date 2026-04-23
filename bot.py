@@ -2,7 +2,7 @@
 Infinitecoin Jumper Bot - Production Ready
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
 """
-import os, json, logging, time, requests, asyncio, threading
+import os, json, logging, time, requests, asyncio
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -20,8 +20,38 @@ IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjm
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-# Token price for display only ($0.00000329 actual price)
-IFC_PRICE_USD = 0.00000329
+# Token price fetched live from DexScreener
+IFC_PRICE_USD = None  # Will be populated on startup
+_last_price_fetch = 0
+_price_cache_seconds = 300  # Refresh every 5 minutes
+
+def get_token_price():
+    """Fetch INFINITE token price from DexScreener. Returns price in USD."""
+    global IFC_PRICE_USD, _last_price_fetch
+    now = time.time()
+    # Return cached price if still fresh
+    if IFC_PRICE_USD is not None and (now - _last_price_fetch) < _price_cache_seconds:
+        return IFC_PRICE_USD
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{IFC_MINT}"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        pairs = data.get("pairs", [])
+        if pairs:
+            # Get price from first active pair (Pump.fun on Solana)
+            price = float(pairs[0].get("priceUsd", 0))
+            if price > 0:
+                IFC_PRICE_USD = price
+                _last_price_fetch = now
+                logger.info("DexScreener price updated: $%.8f", IFC_PRICE_USD)
+                return IFC_PRICE_USD
+        logger.warning("DexScreener returned no price data, using fallback")
+    except Exception as e:
+        logger.error("DexScreener price fetch failed: %s", e)
+    # Fallback to last known or hardcoded
+    if IFC_PRICE_USD is None:
+        IFC_PRICE_USD = 0.00000329
+    return IFC_PRICE_USD
 ESCROW_HOURS = 24
 DAILY_BONUS_AMOUNT = 500
 
@@ -114,6 +144,23 @@ def _setup_solana():
             treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
             treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
             logger.info("ESCROW LIVE - Treasury: %s", treasury_kp.pubkey())
+
+            # Check if treasury ATA exists and has balance
+            ata_info = solana_client.get_account_info_json_parsed(treasury_ata)
+            if not ata_info.value:
+                logger.warning("Treasury ATA does NOT exist: %s", treasury_ata)
+                logger.warning("The treasury wallet needs INFINITE tokens deposited first.")
+                logger.warning("Send INFINITE to: %s", treasury_kp.pubkey())
+            else:
+                parsed = ata_info.value.data.parsed
+                if parsed and 'info' in parsed:
+                    balance = float(parsed['info']['tokenAmount']['uiAmount'] or 0)
+                    logger.info("Treasury INFINITE balance: %s", balance)
+                    if balance <= 0:
+                        logger.warning("Treasury has 0 INFINITE tokens. Fund it before players can claim.")
+
+            # Fetch live price from DexScreener
+            get_token_price()
         except Exception as e:
             logger.error("Failed to initialize Solana client: %s", e)
             escrow_ready = False
@@ -121,8 +168,6 @@ def _setup_solana():
         logger.warning("ESCROW DEMO mode - set TREASURY_PRIVATE_KEY for live transfers")
 
 _setup_solana()
-
-telegram_app = None
 
 # ========== DATABASE ==========
 def get_db(user_id):
@@ -155,7 +200,7 @@ def get_wallet_balance(wallet_address):
 def has_minimum_balance(wallet_address):
     """No minimum balance required - always returns True."""
     balance = get_wallet_balance(wallet_address)
-    usd_value = balance * IFC_PRICE_USD
+    usd_value = balance * get_token_price()
     return {"has_min": True, "balance": balance, "usd_value": usd_value}
 
 def transfer_ifc(recipient, amount):
@@ -313,8 +358,8 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = get_db(uid)[0].get("wallet")
     if existing:
         await update.message.reply_text(
-            f"Wallet connected: `{existing[:4]}...{existing[-4:]}`\n"
-            f"Use /balance to check your INFINITE balance or /claim to withdraw.",
+            f"Wallet connected: `{existing[:4]}...{existing[-4:]}...`\n"
+            "Use /balance to check your INFINITE balance or /claim to withdraw.",
             parse_mode="Markdown"
         )
         return
@@ -496,8 +541,8 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        # Schedule update processing on the permanent background loop
-        _run_async(telegram_app.process_update(update))
+        # Put update directly on the queue — no event loop needed
+        telegram_app.update_queue.put_nowait(update)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
@@ -628,34 +673,18 @@ def api_get_balance(uid):
 @app.route("/setup-webhook")
 def setup_webhook():
     try:
-        f1 = _run_async(telegram_app.bot.delete_webhook(drop_pending_updates=True))
-        f1.result(timeout=10)
-        f2 = _run_async(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"))
-        f2.result(timeout=10)
+        asyncio.run(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+        asyncio.run(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"))
         return jsonify({"success": True, "message": "Webhook configured!"})
     except Exception as e:
         logger.error("Setup webhook error: %s", e)
         return jsonify({"error": str(e)}), 500
 
-# ========== BACKGROUND EVENT LOOP (fixes connection pool exhaustion) ==========
-_bot_loop = None
-_bot_thread = None
-
-def _start_background_loop():
-    global _bot_loop
-    _bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_bot_loop)
-    _bot_loop.run_forever()
-
-def _run_async(coro):
-    """Run an async coroutine in the background loop. Returns a Future."""
-    if _bot_loop is None:
-        raise RuntimeError("Background loop not running")
-    return asyncio.run_coroutine_threadsafe(coro, _bot_loop)
-
 # ========== INIT ==========
+telegram_app = None
+
 def init_bot():
-    global telegram_app, _bot_thread
+    global telegram_app
     telegram_app = Application.builder().token(BOT_TOKEN).connection_pool_size(20).pool_timeout(30.0).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("play", cmd_play))
@@ -667,22 +696,17 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Start background thread with permanent event loop
-    _bot_thread = threading.Thread(target=_start_background_loop, daemon=True)
-    _bot_thread.start()
-
-    # Initialize bot in the background loop
-    future = _run_async(telegram_app.initialize())
+    # Initialize and start in background
     try:
-        future.result(timeout=10)
-        logger.info("Bot initialized successfully")
+        asyncio.run(telegram_app.initialize())
+        asyncio.run(telegram_app.start())
+        logger.info("Bot initialized and started successfully")
     except Exception as e:
-        logger.warning("Bot init warning: %s", e)
+        logger.warning("Bot init/start warning: %s", e)
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
 else:
-    import threading
     init_bot()
 
 if __name__ == "__main__":
