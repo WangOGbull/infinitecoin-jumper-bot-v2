@@ -134,25 +134,25 @@ def _setup_solana():
         return
 
     try:
-        # Token Program ID bytes
+        # Token Program ID: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
         TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
-            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 64,
-            192, 124, 217, 134, 141, 146, 207, 16, 75, 224, 238, 74, 185, 86,
-            78, 164, 128, 68
+            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235,
+            121, 172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133,
+            126, 255, 0, 169
         ]))
-        logger.info("TOKEN_PROGRAM_ID loaded from bytes")
+        logger.info("TOKEN_PROGRAM_ID OK")
     except Exception as e:
         logger.error("Cannot create TOKEN_PROGRAM_ID: %s", e)
         return
 
     try:
-        # Associated Token Program ID bytes
+        # Associated Token Program ID: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8kn1
         ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
-            137, 50, 67, 101, 132, 134, 141, 88, 117, 225, 113, 198, 22, 157,
-            110, 29, 228, 243, 133, 22, 101, 246, 234, 131, 147, 26, 184, 79,
-            200, 34, 99, 125
+            140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142,
+            13, 131, 11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216,
+            219, 233, 248, 70
         ]))
-        logger.info("ASSOCIATED_TOKEN_PROGRAM_ID loaded from bytes")
+        logger.info("ASSOCIATED_TOKEN_PROGRAM_ID OK")
     except Exception as e:
         logger.error("Cannot create ASSOCIATED_TOKEN_PROGRAM_ID: %s", e)
         return
