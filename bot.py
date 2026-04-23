@@ -63,6 +63,22 @@ earnings_db = {}
 escrow_db = {}
 daily_bonus_db = {}
 
+# ========== WALLET UNIQUENESS CHECK ==========
+def _get_uid_by_wallet(wallet_address):
+    """Find which user_id (if any) already owns this wallet. Returns uid or None."""
+    w = wallet_address.strip()
+    for uid, data in user_db.items():
+        if data.get("wallet", "").strip() == w:
+            return uid
+    return None
+
+def _can_set_wallet(uid, wallet_address):
+    """Check if this wallet can be linked to the given user."""
+    existing_uid = _get_uid_by_wallet(wallet_address)
+    if existing_uid is not None and existing_uid != str(uid):
+        return False, existing_uid
+    return True, None
+
 # ========== SOLANA SETUP ==========
 escrow_ready = False
 solana_client = None
@@ -385,6 +401,14 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(wallet) < 32:
         await update.message.reply_text("Invalid address. Must be 32-44 characters.")
         return
+    can_set, existing_uid = _can_set_wallet(uid, wallet)
+    if not can_set:
+        await update.message.reply_text(
+            f"Wallet already linked to another account!\n"
+            f"This wallet is already connected. You cannot reuse it.",
+            parse_mode="Markdown"
+        )
+        return
     user_db.setdefault(uid, {})["wallet"] = wallet
     await update.message.reply_text(
         f"Wallet saved: `{wallet[:4]}...{wallet[-4:]}`\n"
@@ -557,6 +581,13 @@ def wallet_callback():
     uid = request.args.get("user_id", "")
     wallet = request.args.get("phantom_wallet") or request.args.get("wallet") or request.args.get("address") or ""
     if wallet and uid:
+        can_set, existing_uid = _can_set_wallet(uid, wallet)
+        if not can_set:
+            return f"""<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><style>
+body{{background:#0a0a2a;color:#e2e8f0;font-family:monospace;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;padding:20px}}
+.box{{background:rgba(15,23,42,.95);border:2px solid rgba(239,68,68,.4);border-radius:24px;padding:40px;max-width:380px;text-align:center;box-shadow:0 0 40px rgba(239,68,68,.15)}}
+h1{{color:#ef4444;font-size:22px}}p{{color:#94a3b8;font-size:14px;margin-bottom:24px}}
+</style></head><body><div class="box"><h1>Wallet Already Linked</h1><p>This wallet is already connected to another account.<br>You cannot reuse it on multiple accounts.</p></div></body></html>"""
         user_db.setdefault(uid, {})["wallet"] = wallet
         return redirect(f"{GAME_URL}?user_id={uid}&wallet={wallet}")
     return f"""<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><style>
@@ -580,6 +611,9 @@ def api_wallet():
     uid = str(data.get("telegram_user_id", ""))
     if not wallet or not uid or len(wallet) < 32:
         return jsonify({"error": "Invalid"}), 400
+    can_set, existing_uid = _can_set_wallet(uid, wallet)
+    if not can_set:
+        return jsonify({"error": "Wallet already linked to another account", "existing_user": True}), 409
     user_db.setdefault(uid, {})["wallet"] = wallet
     return jsonify({"success": True})
 
