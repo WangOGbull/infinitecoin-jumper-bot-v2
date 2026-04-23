@@ -127,35 +127,42 @@ def _setup_solana():
             return
 
     # Hardcoded Solana program IDs as raw bytes (bypasses base58 decoding issues)
+    # Use Pubkey default() constructor with known byte patterns
+    # These are the on-chain program addresses that never change
+    from solders.pubkey import Pubkey
+    
+    # Token Program: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+    # Try from_string first (works for some addresses in solders 0.19)
     try:
-        from solders.pubkey import Pubkey
-    except ImportError:
-        logger.error("solders.pubkey not available")
-        return
+        TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        logger.info("TOKEN_PROGRAM_ID: from_string OK")
+    except Exception:
+        try:
+            TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
+                6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235,
+                121, 172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133,
+                126, 255, 0, 169
+            ]))
+            logger.info("TOKEN_PROGRAM_ID: from_bytes OK")
+        except Exception as e:
+            logger.error("Cannot create TOKEN_PROGRAM_ID: %s", e)
+            return
 
+    # Associated Token Program: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8kn1
     try:
-        # Token Program ID: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
-        TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
-            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235,
-            121, 172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133,
-            126, 255, 0, 169
-        ]))
-        logger.info("TOKEN_PROGRAM_ID OK")
-    except Exception as e:
-        logger.error("Cannot create TOKEN_PROGRAM_ID: %s", e)
-        return
-
-    try:
-        # Associated Token Program ID: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8kn1
-        ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
-            140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142,
-            13, 131, 11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216,
-            219, 233, 248, 70
-        ]))
-        logger.info("ASSOCIATED_TOKEN_PROGRAM_ID OK")
-    except Exception as e:
-        logger.error("Cannot create ASSOCIATED_TOKEN_PROGRAM_ID: %s", e)
-        return
+        ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8kn1")
+        logger.info("ASSOCIATED_TOKEN_PROGRAM_ID: from_string OK")
+    except Exception:
+        try:
+            ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142,
+                13, 131, 11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216,
+                219, 233, 248, 70
+            ]))
+            logger.info("ASSOCIATED_TOKEN_PROGRAM_ID: from_bytes OK")
+        except Exception as e:
+            logger.error("Cannot create ASSOCIATED_TOKEN_PROGRAM_ID: %s", e)
+            return
 
     # SPL token instructions
     try:
@@ -295,128 +302,128 @@ def _get_treasury_token_account():
         logger.error("RPC token account search failed: %s", e)
         return treasury_ata
 
-def _create_associated_token_account_raw(owner_pubkey, mint_pubkey):
-    """Create ATA using raw RPC + solders. Returns tx signature or None."""
+def _get_or_create_ata(wallet_address):
+    """Get ATA for wallet. Returns (ata_pubkey, existed_before) or (None, False) on failure."""
     try:
         from solders.pubkey import Pubkey
-        from solders.instruction import Instruction, AccountMeta
-        from solders.transaction import Transaction
-        from solders.message import Message
-        from solders.hash import Hash
-        import requests
-
-        owner = Pubkey.from_string(str(owner_pubkey))
-        mint = Pubkey.from_string(str(mint_pubkey))
-
-        # Derive ATA address using hardcoded program IDs
-        seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
+        wallet_pk = Pubkey.from_string(wallet_address)
+        seeds = [bytes(wallet_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
         ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
 
-        # Check if ATA already exists
+        # Check if ATA exists
+        import requests
         check = requests.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [str(ata), {"encoding": "base64"}]
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [str(ata), {"encoding": "base64"}]
         }, timeout=10).json()
+
         if check.get('result', {}).get('value'):
-            return None  # Already exists
+            return ata, True  # ATA already exists
 
-        # System program ID
-        SYS_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
+        # ATA doesn't exist — try to create using solana library Transaction
+        try:
+            from solana.transaction import Transaction
+            tx = Transaction()
+            tx.add(create_associated_token_account_idempotent(
+                payer=treasury_kp.pubkey(),
+                owner=wallet_pk,
+                mint=mint_pubkey
+            ))
+            result = solana_client.send_transaction(tx, treasury_kp)
+            logger.info("Created ATA %s: tx %s", ata, result.value)
+            return ata, False
+        except Exception as create_err:
+            logger.error("Failed to create ATA %s: %s", ata, create_err)
+            return ata, False  # Return ATA anyway — transfer will fail clearly if not created
 
-        # Build create ATA instruction
-        keys = [
-            AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),  # payer
-            AccountMeta(pubkey=ata, is_signer=False, is_writable=True),                   # associated account
-            AccountMeta(pubkey=owner, is_signer=False, is_writable=False),                # owner
-            AccountMeta(pubkey=mint, is_signer=False, is_writable=False),                 # mint
-            AccountMeta(pubkey=SYS_PROGRAM, is_signer=False, is_writable=False),          # system program
-            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),     # token program
-        ]
-        ix = Instruction(
-            program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-            accounts=keys,
-            data=b""
-        )
-
-        # Get recent blockhash
-        blockhash_resp = requests.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 2, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-        }, timeout=10).json()
-        blockhash = Hash.from_string(blockhash_resp['result']['value']['blockhash'])
-
-        # Build, sign, and send transaction
-        msg = Message.new_with_blockhash([ix], treasury_kp.pubkey(), blockhash)
-        tx = Transaction([treasury_kp], msg, blockhash)
-        tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
-
-        send_resp = requests.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 3, "method": "sendTransaction",
-            "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed"}]
-        }, timeout=15).json()
-
-        if 'result' in send_resp:
-            logger.info("Created ATA %s: tx %s", ata, send_resp['result'])
-            return send_resp['result']
-        else:
-            logger.error("Failed to create ATA: %s", send_resp.get('error', 'unknown'))
-            return None
     except Exception as e:
-        logger.error("ATA creation error: %s", e)
-        return None
+        logger.error("ATA lookup error: %s", e)
+        return None, False
 
-def _transfer_tokens_raw(source, dest, amount_int):
-    """Transfer SPL tokens using raw RPC + solders instruction building."""
+def _transfer_tokens_raw(recipient_wallet, amount_int):
+    """Transfer SPL tokens using solana library (reliable) or raw RPC fallback."""
     try:
-        import base64, requests
-        from solders.pubkey import Pubkey
-        from solders.instruction import Instruction, AccountMeta
-        from solders.transaction import Transaction
-        from solders.message import Message
-        from solders.hash import Hash
-        from struct import pack
+        # Find/create recipient ATA
+        recipient_ata, existed = _get_or_create_ata(recipient_wallet)
+        if recipient_ata is None:
+            return {"success": False, "tx": "", "message": "Cannot find recipient token account"}
 
-        # SPL Token transfer_checked instruction layout:
-        # [1 byte: instruction index = 12 for transfer_checked]
-        # [8 bytes: amount (uint64)]
-        # [1 byte: decimals (uint8)]
-        data = pack("<BQB", 12, amount_int, 6)  # instruction=12, amount, decimals=6
+        # Find source account (treasury)
+        source = _get_treasury_token_account()
+        if source is None:
+            return {"success": False, "tx": "", "message": "Treasury has no INFINITE"}
 
-        keys = [
-            AccountMeta(pubkey=Pubkey.from_string(str(source)), is_signer=False, is_writable=True),  # source
-            AccountMeta(pubkey=Pubkey.from_string(str(mint_pubkey)), is_signer=False, is_writable=False),  # mint
-            AccountMeta(pubkey=Pubkey.from_string(str(dest)), is_signer=False, is_writable=True),  # destination
-            AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=False),  # owner
-        ]
+        # Try solana library transfer first
+        if transfer_checked and TransferCheckedParams and TOKEN_PROGRAM_ID:
+            try:
+                from solana.transaction import Transaction
+                ix = transfer_checked(TransferCheckedParams(
+                    program_id=TOKEN_PROGRAM_ID,
+                    source=source,
+                    mint=mint_pubkey,
+                    dest=recipient_ata,
+                    owner=treasury_kp.pubkey(),
+                    amount=amount_int,
+                    decimals=6,
+                    signers=[]
+                ))
+                tx = Transaction()
+                tx.add(ix)
+                result = solana_client.send_transaction(tx, treasury_kp)
+                return {"success": True, "tx": str(result.value), "message": "INFINITE sent!"}
+            except Exception as lib_err:
+                logger.warning("Library transfer failed: %s", lib_err)
 
-        ix = Instruction(
-            program_id=TOKEN_PROGRAM_ID,
-            accounts=keys,
-            data=data
-        )
+        # Fallback: raw RPC with solana Transaction + manually built instruction
+        try:
+            import base64, requests
+            from struct import pack
+            from solana.transaction import Transaction
+            from solders.message import Message
+            from solders.hash import Hash
 
-        # Get recent blockhash
-        blockhash_resp = requests.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-        }, timeout=10).json()
-        blockhash = Hash.from_string(blockhash_resp['result']['value']['blockhash'])
+            # transfer_checked instruction: [12] + [amount:u64] + [decimals:u8]
+            data = pack("<BQB", 12, amount_int, 6)
 
-        # Build, sign, and send transaction
-        msg = Message.new_with_blockhash([ix], treasury_kp.pubkey(), blockhash)
-        tx = Transaction([treasury_kp], msg, blockhash)
-        tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
+            # Build message directly
+            from solders.instruction import Instruction, AccountMeta
+            keys = [
+                AccountMeta(pubkey=source, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=recipient_ata, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=False),
+            ]
+            ix = Instruction(program_id=TOKEN_PROGRAM_ID, accounts=keys, data=data)
 
-        send_resp = requests.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 2, "method": "sendTransaction",
-            "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3}]
-        }, timeout=15).json()
+            # Get blockhash
+            bh_resp = requests.post(SOLANA_RPC, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getLatestBlockhash",
+                "params": [{"commitment": "finalized"}]
+            }, timeout=10).json()
+            blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
 
-        if 'result' in send_resp:
-            return {"success": True, "tx": send_resp['result'], "message": "INFINITE sent!"}
-        else:
-            err = send_resp.get('error', {})
-            logger.error("Raw transfer failed: %s", err)
-            return {"success": False, "tx": "", "message": f"RPC error: {err}"}
+            msg = Message.new_with_blockhash([ix], treasury_kp.pubkey(), blockhash)
+            tx = Transaction([treasury_kp], msg, blockhash)
+            tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
+
+            send_resp = requests.post(SOLANA_RPC, json={
+                "jsonrpc": "2.0", "id": 2,
+                "method": "sendTransaction",
+                "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed"}]
+            }, timeout=15).json()
+
+            if 'result' in send_resp:
+                return {"success": True, "tx": send_resp['result'], "message": "INFINITE sent!"}
+            else:
+                return {"success": False, "tx": "", "message": f"RPC: {send_resp.get('error', 'unknown')}"}
+        except Exception as raw_err:
+            logger.error("Raw transfer failed: %s", raw_err)
+            return {"success": False, "tx": "", "message": str(raw_err)}
+
     except Exception as e:
-        logger.error("Raw transfer error: %s", e)
+        logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
 
 def transfer_ifc(recipient, amount):
@@ -426,50 +433,7 @@ def transfer_ifc(recipient, amount):
             "tx": f"demo_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
             "message": "Demo mode - transfer simulated"
         }
-
-    # Find the actual treasury token account
-    source_account = _get_treasury_token_account()
-    if source_account is None:
-        return {
-            "success": False, "tx": "",
-            "message": "Treasury has no INFINITE token account. Fund the treasury wallet first."
-        }
-
-    from solders.pubkey import Pubkey
-    recipient_pk = Pubkey.from_string(recipient)
-    recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
-
-    # Create recipient ATA if needed
-    if create_associated_token_account_idempotent:
-        try:
-            if not solana_client.get_account_info(recipient_ata).value:
-                tx = Transaction()
-                tx.add(create_associated_token_account_idempotent(
-                    payer=treasury_kp.pubkey(), owner=recipient_pk, mint=mint_pubkey
-                ))
-                solana_client.send_transaction(tx, treasury_kp)
-        except Exception as e:
-            logger.warning("ATA create via library failed, trying raw: %s", e)
-            _create_associated_token_account_raw(recipient_pk, mint_pubkey)
-    else:
-        _create_associated_token_account_raw(recipient_pk, mint_pubkey)
-
-    # Try SPL library transfer first
-    if transfer_checked and TransferCheckedParams and TOKEN_PROGRAM_ID:
-        try:
-            ix = transfer_checked(TransferCheckedParams(
-                program_id=TOKEN_PROGRAM_ID, source=source_account, mint=mint_pubkey,
-                dest=recipient_ata, owner=treasury_kp.pubkey(),
-                amount=int(amount * 1_000_000), decimals=6, signers=[]
-            ))
-            tx = Transaction(); tx.add(ix)
-            result = solana_client.send_transaction(tx, treasury_kp)
-            return {"success": True, "tx": str(result.value), "message": f"{amount:,} INFINITE sent!"}
-        except Exception as e:
-            logger.warning("SPL library transfer failed, falling back to raw RPC: %s", e)
-
-    # Raw RPC fallback — ALWAYS WORKS
-    return _transfer_tokens_raw(source_account, recipient_ata, int(amount * 1_000_000))
+    return _transfer_tokens_raw(recipient, int(amount * 1_000_000))
 
 # ========== ESCROW LOGIC (time-based only, no balance gate) ==========
 def is_escrow_active(uid):
