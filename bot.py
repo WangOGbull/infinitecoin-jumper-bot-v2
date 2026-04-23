@@ -2,7 +2,7 @@
 Infinitecoin Jumper Bot - Production Ready
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
 """
-import os, json, logging, time, requests, asyncio, base64, threading
+import os, json, logging, time, requests, asyncio, threading
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -310,7 +310,7 @@ def _get_or_create_ata(wallet_address):
         seeds = [bytes(wallet_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
         ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
 
-        # Check if ATA exists
+        # Check if ATA exists via raw RPC
         import requests
         check = requests.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1,
@@ -321,21 +321,35 @@ def _get_or_create_ata(wallet_address):
         if check.get('result', {}).get('value'):
             return ata, True  # ATA already exists
 
-        # ATA doesn't exist — try to create using solana library Transaction
+        # ATA doesn't exist — create it
+        # Build ATA creation instruction manually
+        #   Instruction accounts: [payer, ata, owner, mint, system_program, token_program]
         try:
             from solana.transaction import Transaction
+            from solders.instruction import Instruction, AccountMeta
+            from struct import pack
+
+            sys_prog = Pubkey.from_string("11111111111111111111111111111111")
+
+            keys = [
+                AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),   # payer
+                AccountMeta(pubkey=ata, is_signer=False, is_writable=True),                    # ata
+                AccountMeta(pubkey=wallet_pk, is_signer=False, is_writable=False),             # owner
+                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),            # mint
+                AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),               # system_program
+                AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),       # token_program
+            ]
+            # ATA creation instruction data is empty (0 bytes)
+            ix = Instruction(program_id=ASSOCIATED_TOKEN_PROGRAM_ID, accounts=keys, data=b"")
+
             tx = Transaction()
-            tx.add(create_associated_token_account_idempotent(
-                payer=treasury_kp.pubkey(),
-                owner=wallet_pk,
-                mint=mint_pubkey
-            ))
+            tx.add(ix)
             result = solana_client.send_transaction(tx, treasury_kp)
             logger.info("Created ATA %s: tx %s", ata, result.value)
             return ata, False
         except Exception as create_err:
             logger.error("Failed to create ATA %s: %s", ata, create_err)
-            return ata, False  # Return ATA anyway — transfer will fail clearly if not created
+            return ata, False
 
     except Exception as e:
         logger.error("ATA lookup error: %s", e)
@@ -375,19 +389,15 @@ def _transfer_tokens_raw(recipient_wallet, amount_int):
             except Exception as lib_err:
                 logger.warning("Library transfer failed: %s", lib_err)
 
-        # Fallback: raw RPC with solana Transaction + manually built instruction
+        # Fallback: use solana library Transaction (proven to work)
         try:
-            import base64, requests
-            from struct import pack
             from solana.transaction import Transaction
-            from solders.message import Message
-            from solders.hash import Hash
+            from solders.instruction import Instruction, AccountMeta
+            from struct import pack
 
             # transfer_checked instruction: [12] + [amount:u64] + [decimals:u8]
             data = pack("<BQB", 12, amount_int, 6)
 
-            # Build message directly
-            from solders.instruction import Instruction, AccountMeta
             keys = [
                 AccountMeta(pubkey=source, is_signer=False, is_writable=True),
                 AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
@@ -396,28 +406,10 @@ def _transfer_tokens_raw(recipient_wallet, amount_int):
             ]
             ix = Instruction(program_id=TOKEN_PROGRAM_ID, accounts=keys, data=data)
 
-            # Get blockhash
-            bh_resp = requests.post(SOLANA_RPC, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getLatestBlockhash",
-                "params": [{"commitment": "finalized"}]
-            }, timeout=10).json()
-            blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
-
-            msg = Message.new_with_blockhash([ix], treasury_kp.pubkey(), blockhash)
-            tx = Transaction([treasury_kp], msg, blockhash)
-            tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
-
-            send_resp = requests.post(SOLANA_RPC, json={
-                "jsonrpc": "2.0", "id": 2,
-                "method": "sendTransaction",
-                "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed"}]
-            }, timeout=15).json()
-
-            if 'result' in send_resp:
-                return {"success": True, "tx": send_resp['result'], "message": "INFINITE sent!"}
-            else:
-                return {"success": False, "tx": "", "message": f"RPC: {send_resp.get('error', 'unknown')}"}
+            tx = Transaction()
+            tx.add(ix)
+            result = solana_client.send_transaction(tx, treasury_kp)
+            return {"success": True, "tx": str(result.value), "message": "INFINITE sent!"}
         except Exception as raw_err:
             logger.error("Raw transfer failed: %s", raw_err)
             return {"success": False, "tx": "", "message": str(raw_err)}
