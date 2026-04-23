@@ -2,7 +2,7 @@
 Infinitecoin Jumper Bot - Production Ready
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
 """
-import os, json, logging, time, requests, asyncio, base64
+import os, json, logging, time, requests, asyncio, base64, threading
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -125,14 +125,35 @@ def _setup_solana():
             logger.error("Transaction class not found: %s", e)
             return
 
-    # Hardcoded Solana program IDs (reliable fallback when spl library fails)
+    # Hardcoded Solana program IDs as raw bytes (bypasses base58 decoding issues)
     try:
         from solders.pubkey import Pubkey
-        TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knl")
-        logger.info("Using hardcoded Solana program IDs")
+    except ImportError:
+        logger.error("solders.pubkey not available")
+        return
+
+    try:
+        # Token Program ID bytes
+        TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
+            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 64,
+            192, 124, 217, 134, 141, 146, 207, 16, 75, 224, 238, 74, 185, 86,
+            78, 164, 128, 68
+        ]))
+        logger.info("TOKEN_PROGRAM_ID loaded from bytes")
     except Exception as e:
-        logger.error("Cannot create program IDs: %s", e)
+        logger.error("Cannot create TOKEN_PROGRAM_ID: %s", e)
+        return
+
+    try:
+        # Associated Token Program ID bytes
+        ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_bytes(bytes([
+            137, 50, 67, 101, 132, 134, 141, 88, 117, 225, 113, 198, 22, 157,
+            110, 29, 228, 243, 133, 22, 101, 246, 234, 131, 147, 26, 184, 79,
+            200, 34, 99, 125
+        ]))
+        logger.info("ASSOCIATED_TOKEN_PROGRAM_ID loaded from bytes")
+    except Exception as e:
+        logger.error("Cannot create ASSOCIATED_TOKEN_PROGRAM_ID: %s", e)
         return
 
     # SPL token instructions
@@ -965,7 +986,6 @@ def init_bot():
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
 else:
-    import threading
     init_bot()
 
 if __name__ == "__main__":
