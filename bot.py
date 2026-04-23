@@ -170,8 +170,8 @@ def _setup_solana():
         TransferCheckedParams = _tcp
         logger.info("spl.token.instructions loaded OK")
     except ImportError as e:
-        logger.warning("spl.token.instructions not available: %s", e)
-        # Build fallback get_associated_token_address
+        logger.info("SPL library unavailable (expected): %s", e)
+        logger.info("Using built-in fallbacks for token operations")
         def _gata_fallback(owner, mint):
             seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
             result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
@@ -192,29 +192,7 @@ def _setup_solana():
             logger.info("ESCROW LIVE - Treasury wallet: %s", treasury_kp.pubkey())
             logger.info("Treasury ATA (expected): %s", treasury_ata)
 
-            # Check if treasury ATA exists
-            try:
-                ata_balance = solana_client.get_token_account_balance(treasury_ata)
-                if hasattr(ata_balance, 'value') and ata_balance.value:
-                    balance = float(ata_balance.value.ui_amount or 0)
-                    logger.info("Treasury INFINITE balance: %s", balance)
-                else:
-                    logger.warning("Treasury ATA exists but balance check returned no data")
-            except Exception:
-                logger.warning("Treasury ATA not found on-chain. Attempting to create it...")
-                try:
-                    from solana.transaction import Transaction
-                    tx = Transaction()
-                    tx.add(create_associated_token_account_idempotent(
-                        payer=treasury_kp.pubkey(),
-                        owner=treasury_kp.pubkey(),
-                        mint=mint_pubkey
-                    ))
-                    result = solana_client.send_transaction(tx, treasury_kp)
-                    logger.info("Treasury ATA created: %s", result.value)
-                except Exception as create_err:
-                    logger.error("Failed to create treasury ATA: %s", create_err)
-                    logger.error("Please ensure treasury wallet has SOL for fees and INFINITE tokens.")
+            # Skip library balance check — _verify_treasury uses raw RPC which works reliably
 
         except Exception as e:
             logger.error("Failed to initialize Solana client: %s", e)
