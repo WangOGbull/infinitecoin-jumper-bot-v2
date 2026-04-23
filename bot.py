@@ -163,8 +163,14 @@ def _setup_solana():
             logger.info("Treasury ATA (expected): %s", treasury_ata)
 
             # Check if treasury ATA exists
-            ata_info = solana_client.get_account_info_json_parsed(treasury_ata)
-            if not ata_info.value:
+            try:
+                ata_balance = solana_client.get_token_account_balance(treasury_ata)
+                if hasattr(ata_balance, 'value') and ata_balance.value:
+                    balance = float(ata_balance.value.ui_amount or 0)
+                    logger.info("Treasury INFINITE balance: %s", balance)
+                else:
+                    logger.warning("Treasury ATA exists but balance check returned no data")
+            except Exception:
                 logger.warning("Treasury ATA not found on-chain. Attempting to create it...")
                 try:
                     from solana.transaction import Transaction
@@ -179,13 +185,6 @@ def _setup_solana():
                 except Exception as create_err:
                     logger.error("Failed to create treasury ATA: %s", create_err)
                     logger.error("Please ensure treasury wallet has SOL for fees and INFINITE tokens.")
-            else:
-                parsed = ata_info.value.data.parsed
-                if parsed and 'info' in parsed:
-                    balance = float(parsed['info']['tokenAmount']['uiAmount'] or 0)
-                    logger.info("Treasury INFINITE balance: %s", balance)
-                else:
-                    logger.warning("Treasury ATA exists but has no parsed data (may be uninitialized)")
 
         except Exception as e:
             logger.error("Failed to initialize Solana client: %s", e)
@@ -223,15 +222,13 @@ def get_wallet_balance(wallet_address):
     if not escrow_ready or not get_associated_token_address:
         return 0
     try:
-        # Guard against missing Pubkey import
         from solders.pubkey import Pubkey
         recipient_pk = Pubkey.from_string(wallet_address)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
-        resp = solana_client.get_account_info_json_parsed(recipient_ata)
-        if resp.value and hasattr(resp.value, 'data'):
-            parsed = resp.value.data.parsed
-            if parsed and 'info' in parsed:
-                return float(parsed['info']['tokenAmount']['uiAmount'] or 0)
+        # Use get_token_account_balance instead of get_account_info_json_parsed
+        resp = solana_client.get_token_account_balance(recipient_ata)
+        if hasattr(resp, 'value') and resp.value:
+            return float(resp.value.ui_amount or 0)
         return 0
     except Exception as e:
         logger.error("Balance check error: %s", e)
@@ -250,34 +247,45 @@ def _get_treasury_token_account():
         return None
     try:
         # First check the standard ATA
-        ata_info = solana_client.get_account_info_json_parsed(treasury_ata)
-        if ata_info.value:
-            parsed = ata_info.value.data.parsed
-            if parsed and 'info' in parsed:
-                balance = float(parsed['info']['tokenAmount']['uiAmount'] or 0)
+        try:
+            ata_info = solana_client.get_token_account_balance(treasury_ata)
+            if hasattr(ata_info, 'value') and ata_info.value:
+                balance = float(ata_info.value.ui_amount or 0)
                 if balance > 0:
                     logger.info("Treasury tokens found in ATA: %s (balance: %s)", treasury_ata, balance)
                     return treasury_ata
+        except Exception:
+            pass  # ATA may not exist
 
         # If ATA is empty/missing, search all token accounts for this owner
         logger.warning("ATA empty or missing. Searching all token accounts for treasury...")
         from solders.pubkey import Pubkey
-        resp = solana_client.get_token_accounts_by_owner(
-            treasury_kp.pubkey(),
-            {"programId": str(TOKEN_PROGRAM_ID)},
-            encoding="jsonParsed"
-        )
-        for acc in resp.value:
-            parsed = acc.account.data.parsed
-            if parsed and 'info' in parsed:
-                info = parsed['info']
-                mint_addr = info.get('mint', '')
-                if mint_addr == IFC_MINT:
-                    balance = float(info['tokenAmount']['uiAmount'] or 0)
-                    addr = Pubkey.from_string(acc.pubkey)
-                    if balance > 0:
-                        logger.info("Found treasury token account: %s (balance: %s)", addr, balance)
-                        return addr
+        try:
+            resp = solana_client.get_token_accounts_by_owner(
+                treasury_kp.pubkey(),
+                {"mint": str(mint_pubkey)}
+            )
+        except TypeError:
+            # Fallback: try without dict wrapper
+            resp = solana_client.get_token_accounts_by_owner(
+                treasury_kp.pubkey(),
+                {"mint": str(mint_pubkey)}
+            )
+
+        if hasattr(resp, 'value') and resp.value:
+            for acc in resp.value:
+                # Try to parse balance from account data
+                try:
+                    addr = Pubkey.from_string(str(acc.pubkey))
+                    # Fetch balance for this specific account
+                    bal_resp = solana_client.get_token_account_balance(addr)
+                    if hasattr(bal_resp, 'value') and bal_resp.value:
+                        balance = float(bal_resp.value.ui_amount or 0)
+                        if balance > 0:
+                            logger.info("Found treasury token account: %s (balance: %s)", addr, balance)
+                            return addr
+                except Exception:
+                    continue
         logger.error("No treasury token account found with INFINITE balance")
         return None
     except Exception as e:
