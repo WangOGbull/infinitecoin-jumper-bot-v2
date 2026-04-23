@@ -159,24 +159,34 @@ def _setup_solana():
             mint_pubkey = Pubkey.from_string(IFC_MINT)
             treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
             treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
-            logger.info("ESCROW LIVE - Treasury: %s", treasury_kp.pubkey())
+            logger.info("ESCROW LIVE - Treasury wallet: %s", treasury_kp.pubkey())
+            logger.info("Treasury ATA (expected): %s", treasury_ata)
 
-            # Check if treasury ATA exists and has balance
+            # Check if treasury ATA exists
             ata_info = solana_client.get_account_info_json_parsed(treasury_ata)
             if not ata_info.value:
-                logger.warning("Treasury ATA does NOT exist: %s", treasury_ata)
-                logger.warning("The treasury wallet needs INFINITE tokens deposited first.")
-                logger.warning("Send INFINITE to: %s", treasury_kp.pubkey())
+                logger.warning("Treasury ATA not found on-chain. Attempting to create it...")
+                try:
+                    from solana.transaction import Transaction
+                    tx = Transaction()
+                    tx.add(create_associated_token_account_idempotent(
+                        payer=treasury_kp.pubkey(),
+                        owner=treasury_kp.pubkey(),
+                        mint=mint_pubkey
+                    ))
+                    result = solana_client.send_transaction(tx, treasury_kp)
+                    logger.info("Treasury ATA created: %s", result.value)
+                except Exception as create_err:
+                    logger.error("Failed to create treasury ATA: %s", create_err)
+                    logger.error("Please ensure treasury wallet has SOL for fees and INFINITE tokens.")
             else:
                 parsed = ata_info.value.data.parsed
                 if parsed and 'info' in parsed:
                     balance = float(parsed['info']['tokenAmount']['uiAmount'] or 0)
                     logger.info("Treasury INFINITE balance: %s", balance)
-                    if balance <= 0:
-                        logger.warning("Treasury has 0 INFINITE tokens. Fund it before players can claim.")
+                else:
+                    logger.warning("Treasury ATA exists but has no parsed data (may be uninitialized)")
 
-            # Fetch live price from DexScreener
-            get_token_price()
         except Exception as e:
             logger.error("Failed to initialize Solana client: %s", e)
             escrow_ready = False
@@ -184,6 +194,20 @@ def _setup_solana():
         logger.warning("ESCROW DEMO mode - set TREASURY_PRIVATE_KEY for live transfers")
 
 _setup_solana()
+
+# Post-init: verify treasury token account (after all functions are defined)
+def _verify_treasury():
+    if not escrow_ready or not solana_client:
+        return
+    try:
+        source = _get_treasury_token_account()
+        if source:
+            logger.info("Treasury ready for transfers using account: %s", source)
+        else:
+            logger.warning("Treasury wallet has no INFINITE token account with balance.")
+            logger.warning("Send INFINITE to: %s", treasury_kp.pubkey())
+    except Exception as e:
+        logger.error("Treasury verification error: %s", e)
 
 # ========== DATABASE ==========
 def get_db(user_id):
@@ -219,6 +243,47 @@ def has_minimum_balance(wallet_address):
     usd_value = balance * get_token_price()
     return {"has_min": True, "balance": balance, "usd_value": usd_value}
 
+def _get_treasury_token_account():
+    """Find the treasury token account that actually holds INFINITE tokens.
+    Returns the token account address (Pubkey) or None."""
+    if not escrow_ready or not solana_client:
+        return None
+    try:
+        # First check the standard ATA
+        ata_info = solana_client.get_account_info_json_parsed(treasury_ata)
+        if ata_info.value:
+            parsed = ata_info.value.data.parsed
+            if parsed and 'info' in parsed:
+                balance = float(parsed['info']['tokenAmount']['uiAmount'] or 0)
+                if balance > 0:
+                    logger.info("Treasury tokens found in ATA: %s (balance: %s)", treasury_ata, balance)
+                    return treasury_ata
+
+        # If ATA is empty/missing, search all token accounts for this owner
+        logger.warning("ATA empty or missing. Searching all token accounts for treasury...")
+        from solders.pubkey import Pubkey
+        resp = solana_client.get_token_accounts_by_owner(
+            treasury_kp.pubkey(),
+            {"programId": str(TOKEN_PROGRAM_ID)},
+            encoding="jsonParsed"
+        )
+        for acc in resp.value:
+            parsed = acc.account.data.parsed
+            if parsed and 'info' in parsed:
+                info = parsed['info']
+                mint_addr = info.get('mint', '')
+                if mint_addr == IFC_MINT:
+                    balance = float(info['tokenAmount']['uiAmount'] or 0)
+                    addr = Pubkey.from_string(acc.pubkey)
+                    if balance > 0:
+                        logger.info("Found treasury token account: %s (balance: %s)", addr, balance)
+                        return addr
+        logger.error("No treasury token account found with INFINITE balance")
+        return None
+    except Exception as e:
+        logger.error("Error searching treasury token accounts: %s", e)
+        return None
+
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
         return {
@@ -227,6 +292,15 @@ def transfer_ifc(recipient, amount):
             "message": "Demo mode - transfer simulated"
         }
     try:
+        # Find the actual treasury token account with INFINITE
+        source_account = _get_treasury_token_account()
+        if source_account is None:
+            return {
+                "success": False,
+                "tx": "",
+                "message": "Treasury has no INFINITE token account. Fund the treasury wallet first."
+            }
+
         # Import Pubkey and Transaction locally (module-level may not be available)
         from solders.pubkey import Pubkey
         try:
@@ -251,7 +325,7 @@ def transfer_ifc(recipient, amount):
         if transfer_checked and TransferCheckedParams and TOKEN_PROGRAM_ID:
             ix = transfer_checked(TransferCheckedParams(
                 program_id=TOKEN_PROGRAM_ID,
-                source=treasury_ata,
+                source=source_account,
                 mint=mint_pubkey,
                 dest=recipient_ata,
                 owner=treasury_kp.pubkey(),
@@ -268,7 +342,7 @@ def transfer_ifc(recipient, amount):
             from spl.token.client import Token
             token = Token(solana_client, mint_pubkey, TOKEN_PROGRAM_ID, treasury_kp)
             result = token.transfer(
-                source=treasury_ata,
+                source=source_account,
                 dest=recipient_ata,
                 owner=treasury_kp,
                 amount=int(amount * 1_000_000),
@@ -277,9 +351,6 @@ def transfer_ifc(recipient, amount):
     except Exception as e:
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": "", "message": str(e)}
-
-# ========== ESCROW LOGIC (time-based only, no balance gate) ==========
-def is_escrow_active(uid):
     e = escrow_db.get(str(uid), {})
     if not e or e.get("amount", 0) <= 0:
         return False
@@ -763,6 +834,11 @@ def init_bot():
     _bot_thread.start()
     # Give the thread time to start the loop
     time.sleep(0.5)
+
+    # Verify treasury has tokens (after all functions defined)
+    if escrow_ready:
+        _verify_treasury()
+        get_token_price()
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
