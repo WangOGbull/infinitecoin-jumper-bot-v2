@@ -199,14 +199,15 @@ def _verify_treasury():
     if not escrow_ready or not solana_client:
         return
     try:
-        source = _get_treasury_token_account()
-        if source:
-            logger.info("Treasury ready for transfers using account: %s", source)
+        resp = solana_client.get_token_account_balance(treasury_ata)
+        if hasattr(resp, 'value') and resp.value:
+            balance = float(resp.value.ui_amount or 0)
+            logger.info("Treasury ready: %s INFINITE in %s", balance, treasury_ata)
         else:
-            logger.warning("Treasury wallet has no INFINITE token account with balance.")
-            logger.warning("Send INFINITE to: %s", treasury_kp.pubkey())
+            logger.warning("Treasury ATA has no balance. Send INFINITE to: %s", treasury_kp.pubkey())
     except Exception as e:
-        logger.error("Treasury verification error: %s", e)
+        logger.warning("Treasury balance check failed: %s", e)
+        logger.info("Will retry on first transfer attempt")
 
 # ========== DATABASE ==========
 def get_db(user_id):
@@ -241,56 +242,10 @@ def has_minimum_balance(wallet_address):
     return {"has_min": True, "balance": balance, "usd_value": usd_value}
 
 def _get_treasury_token_account():
-    """Find the treasury token account that actually holds INFINITE tokens.
-    Returns the token account address (Pubkey) or None."""
-    if not escrow_ready or not solana_client:
+    """Returns the treasury ATA. Creates it if needed."""
+    if not escrow_ready:
         return None
-    try:
-        # First check the standard ATA
-        try:
-            ata_info = solana_client.get_token_account_balance(treasury_ata)
-            if hasattr(ata_info, 'value') and ata_info.value:
-                balance = float(ata_info.value.ui_amount or 0)
-                if balance > 0:
-                    logger.info("Treasury tokens found in ATA: %s (balance: %s)", treasury_ata, balance)
-                    return treasury_ata
-        except Exception:
-            pass  # ATA may not exist
-
-        # If ATA is empty/missing, search all token accounts for this owner
-        logger.warning("ATA empty or missing. Searching all token accounts for treasury...")
-        from solders.pubkey import Pubkey
-        try:
-            resp = solana_client.get_token_accounts_by_owner(
-                treasury_kp.pubkey(),
-                {"mint": str(mint_pubkey)}
-            )
-        except TypeError:
-            # Fallback: try without dict wrapper
-            resp = solana_client.get_token_accounts_by_owner(
-                treasury_kp.pubkey(),
-                {"mint": str(mint_pubkey)}
-            )
-
-        if hasattr(resp, 'value') and resp.value:
-            for acc in resp.value:
-                # Try to parse balance from account data
-                try:
-                    addr = Pubkey.from_string(str(acc.pubkey))
-                    # Fetch balance for this specific account
-                    bal_resp = solana_client.get_token_account_balance(addr)
-                    if hasattr(bal_resp, 'value') and bal_resp.value:
-                        balance = float(bal_resp.value.ui_amount or 0)
-                        if balance > 0:
-                            logger.info("Found treasury token account: %s (balance: %s)", addr, balance)
-                            return addr
-                except Exception:
-                    continue
-        logger.error("No treasury token account found with INFINITE balance")
-        return None
-    except Exception as e:
-        logger.error("Error searching treasury token accounts: %s", e)
-        return None
+    return treasury_ata
 
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
