@@ -326,19 +326,11 @@ def _get_treasury_token_account():
         logger.warning("Token search failed: %s", e)
     return treasury_ata
 
-class _TxIx:
-    """Wrapper that converts solders Instruction to solana Transaction format."""
-    def __init__(self, program_id, keys, data):
-        self.program_id = program_id
-        self.keys = keys      # solana expects 'keys', solders uses 'accounts'
-        self.data = data
-
 def _get_or_create_ata(wallet_address):
     """Get or create ATA. Returns ata_pubkey or None."""
     try:
         from solders.pubkey import Pubkey
-        from solders.instruction import Instruction, AccountMeta
-        from solana.transaction import Transaction
+        from solana.transaction import Transaction, TransactionInstruction, AccountMeta as SolanaAccountMeta
 
         wallet_pk = Pubkey.from_string(wallet_address)
         seeds = [bytes(wallet_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
@@ -349,18 +341,18 @@ def _get_or_create_ata(wallet_address):
         if data.get('result', {}).get('value'):
             return ata
         
-        # Create ATA
+        # Create ATA using solana's native TransactionInstruction
         sys_prog = Pubkey.from_string("11111111111111111111111111111111")
-        ix = _TxIx(
-            program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+        ix = TransactionInstruction(
             keys=[
-                AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),
-                AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=wallet_pk, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+                SolanaAccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),
+                SolanaAccountMeta(pubkey=ata, is_signer=False, is_writable=True),
+                SolanaAccountMeta(pubkey=wallet_pk, is_signer=False, is_writable=False),
+                SolanaAccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                SolanaAccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
+                SolanaAccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
             ],
+            program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
             data=b""
         )
         
@@ -374,11 +366,10 @@ def _get_or_create_ata(wallet_address):
         return None
 
 def _transfer_tokens_raw(recipient_wallet, amount_int):
-    """Transfer INFINITE using solana Transaction + wrapper."""
+    """Transfer INFINITE using solana TransactionInstruction."""
     try:
         from solders.pubkey import Pubkey
-        from solders.instruction import AccountMeta
-        from solana.transaction import Transaction
+        from solana.transaction import Transaction, TransactionInstruction, AccountMeta as SolanaAccountMeta
         import struct
 
         recipient_ata = _get_or_create_ata(recipient_wallet)
@@ -390,14 +381,14 @@ def _transfer_tokens_raw(recipient_wallet, amount_int):
             return {"success": False, "tx": "", "message": "Treasury has no INFINITE"}
 
         ix_data = struct.pack("<BQB", 12, amount_int, 6)
-        ix = _TxIx(
-            program_id=TOKEN_PROGRAM_ID,
+        ix = TransactionInstruction(
             keys=[
-                AccountMeta(pubkey=Pubkey.from_string(str(source)), is_signer=False, is_writable=True),
-                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=Pubkey.from_string(str(recipient_ata)), is_signer=False, is_writable=True),
-                AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=False),
+                SolanaAccountMeta(pubkey=Pubkey.from_string(str(source)), is_signer=False, is_writable=True),
+                SolanaAccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                SolanaAccountMeta(pubkey=Pubkey.from_string(str(recipient_ata)), is_signer=False, is_writable=True),
+                SolanaAccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=False),
             ],
+            program_id=TOKEN_PROGRAM_ID,
             data=ix_data
         )
 
