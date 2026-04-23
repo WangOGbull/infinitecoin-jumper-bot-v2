@@ -541,8 +541,12 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-        # Put update directly on the queue — no event loop needed
-        telegram_app.update_queue.put_nowait(update)
+        # Schedule update processing on the permanent background loop
+        future = asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update), _bot_loop
+        )
+        # Wait for processing to complete (with timeout)
+        future.result(timeout=10)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error("Webhook error: %s", e)
@@ -673,8 +677,14 @@ def api_get_balance(uid):
 @app.route("/setup-webhook")
 def setup_webhook():
     try:
-        asyncio.run(telegram_app.bot.delete_webhook(drop_pending_updates=True))
-        asyncio.run(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"))
+        f1 = asyncio.run_coroutine_threadsafe(
+            telegram_app.bot.delete_webhook(drop_pending_updates=True), _bot_loop
+        )
+        f1.result(timeout=10)
+        f2 = asyncio.run_coroutine_threadsafe(
+            telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"), _bot_loop
+        )
+        f2.result(timeout=10)
         return jsonify({"success": True, "message": "Webhook configured!"})
     except Exception as e:
         logger.error("Setup webhook error: %s", e)
@@ -682,8 +692,11 @@ def setup_webhook():
 
 # ========== INIT ==========
 telegram_app = None
+_bot_loop = None
+_bot_thread = None
 
-def init_bot():
+async def _bot_main():
+    """Async main that runs in the background thread forever."""
     global telegram_app
     telegram_app = Application.builder().token(BOT_TOKEN).connection_pool_size(20).pool_timeout(30.0).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
@@ -696,17 +709,31 @@ def init_bot():
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Initialize and start in background
-    try:
-        asyncio.run(telegram_app.initialize())
-        asyncio.run(telegram_app.start())
-        logger.info("Bot initialized and started successfully")
-    except Exception as e:
-        logger.warning("Bot init/start warning: %s", e)
+    await telegram_app.initialize()
+    await telegram_app.start()
+    logger.info("Bot initialized and started successfully")
+
+    # Keep running forever (updater processes queue internally)
+    while True:
+        await asyncio.sleep(3600)
+
+def init_bot():
+    global _bot_loop, _bot_thread
+    _bot_loop = asyncio.new_event_loop()
+
+    def _run_loop():
+        asyncio.set_event_loop(_bot_loop)
+        _bot_loop.run_until_complete(_bot_main())
+
+    _bot_thread = threading.Thread(target=_run_loop, daemon=True)
+    _bot_thread.start()
+    # Give the thread time to start the loop
+    time.sleep(0.5)
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
 else:
+    import threading
     init_bot()
 
 if __name__ == "__main__":
