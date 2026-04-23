@@ -199,15 +199,24 @@ def _verify_treasury():
     if not escrow_ready or not solana_client:
         return
     try:
-        resp = solana_client.get_token_account_balance(treasury_ata)
-        if hasattr(resp, 'value') and resp.value:
-            balance = float(resp.value.ui_amount or 0)
-            logger.info("Treasury ready: %s INFINITE in %s", balance, treasury_ata)
-        else:
-            logger.warning("Treasury ATA has no balance. Send INFINITE to: %s", treasury_kp.pubkey())
+        import requests
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [str(treasury_kp.pubkey()), {"mint": IFC_MINT}, {"encoding": "jsonParsed"}]
+        }
+        resp = requests.post(SOLANA_RPC, json=payload, timeout=15)
+        data = resp.json()
+        if 'result' in data and data['result'].get('value'):
+            for acc in data['result']['value']:
+                info = acc['account']['data']['parsed']['info']
+                balance = float(info['tokenAmount']['uiAmount'] or 0)
+                addr = acc['pubkey']
+                logger.info("Treasury ready: %s INFINITE in %s", balance, addr)
+                return
+        logger.warning("Treasury has no INFINITE. Send tokens to: %s", treasury_kp.pubkey())
     except Exception as e:
-        logger.warning("Treasury balance check failed: %s", e)
-        logger.info("Will retry on first transfer attempt")
+        logger.warning("Treasury verify failed: %s", e)
 
 # ========== DATABASE ==========
 def get_db(user_id):
@@ -242,10 +251,40 @@ def has_minimum_balance(wallet_address):
     return {"has_min": True, "balance": balance, "usd_value": usd_value}
 
 def _get_treasury_token_account():
-    """Returns the treasury ATA. Creates it if needed."""
-    if not escrow_ready:
+    """Find the actual treasury token account using raw HTTP RPC."""
+    if not escrow_ready or not solana_client:
         return None
-    return treasury_ata
+    try:
+        # Use raw HTTP request to bypass solana library API issues
+        import requests
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                str(treasury_kp.pubkey()),
+                {"mint": IFC_MINT},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        resp = requests.post(SOLANA_RPC, json=payload, timeout=15)
+        data = resp.json()
+        if 'result' in data and data['result'].get('value'):
+            for acc in data['result']['value']:
+                addr = acc['pubkey']
+                info = acc['account']['data']['parsed']['info']
+                balance = info['tokenAmount']['uiAmount']
+                if balance and float(balance) > 0:
+                    from solders.pubkey import Pubkey
+                    pk = Pubkey.from_string(addr)
+                    logger.info("Found treasury token account: %s (balance: %s)", addr, balance)
+                    return pk
+        # Fallback: return computed ATA anyway (may need funding)
+        logger.warning("No token account found via RPC, using computed ATA: %s", treasury_ata)
+        return treasury_ata
+    except Exception as e:
+        logger.error("RPC token account search failed: %s", e)
+        return treasury_ata
 
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
