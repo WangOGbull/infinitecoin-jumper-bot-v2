@@ -89,7 +89,8 @@ treasury_ata = None
 def _setup_solana():
     global escrow_ready, solana_client, mint_pubkey, treasury_kp, treasury_ata
     global create_associated_token_account_idempotent, get_associated_token_address
-    global transfer_checked, TransferCheckedParams, TOKEN_PROGRAM_ID
+    global transfer_checked, TransferCheckedParams
+    global TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
 
     create_associated_token_account_idempotent = None
     get_associated_token_address = None
