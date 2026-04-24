@@ -26,7 +26,6 @@ _last_price_fetch = 0
 _price_cache_seconds = 300
 
 def get_token_price():
-    """Fetch INFINITE token price from DexScreener."""
     global IFC_PRICE_USD, _last_price_fetch
     now = time.time()
     if IFC_PRICE_USD is not None and (now - _last_price_fetch) < _price_cache_seconds:
@@ -106,13 +105,33 @@ def _setup_solana():
         logger.error("solana.rpc not found: %s", e)
         return
 
-    # Hardcoded program IDs via from_string (works for these well-known addresses)
-    TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-    # FIX: Corrected typo in Associated Token Program ID (was ...kn1, now ...knL)
+    # Program IDs
+    DEFAULT_TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    TOKEN_2022_PROGRAM = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
     ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-    logger.info("Solana program IDs loaded")
 
-    # Try SPL library (may not be available)
+    solana_client = Client(SOLANA_RPC)
+    mint_pubkey = Pubkey.from_string(IFC_MINT)
+
+    # Detect actual token program from mint owner
+    try:
+        mint_info = solana_client.get_account_info(mint_pubkey)
+        if hasattr(mint_info, 'value') and mint_info.value:
+            mint_owner = str(mint_info.value.owner)
+        else:
+            mint_owner = mint_info.get('result', {}).get('value', {}).get('owner')
+        
+        if mint_owner == str(TOKEN_2022_PROGRAM):
+            TOKEN_PROGRAM_ID = TOKEN_2022_PROGRAM
+            logger.info("Detected Token-2022 program for mint")
+        else:
+            TOKEN_PROGRAM_ID = DEFAULT_TOKEN_PROGRAM
+            logger.info("Detected standard SPL Token program for mint: %s", mint_owner)
+    except Exception as e:
+        logger.warning("Mint owner detection failed, defaulting to standard: %s", e)
+        TOKEN_PROGRAM_ID = DEFAULT_TOKEN_PROGRAM
+
+    # Try SPL library
     try:
         from spl.token.instructions import (
             create_associated_token_account_idempotent as _cati,
@@ -126,7 +145,6 @@ def _setup_solana():
         TransferCheckedParams = _tcp
         logger.info("SPL library loaded")
     except ImportError:
-        # Fallback ATA derivation
         def _gata_fallback(owner, mint):
             seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
             result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
@@ -140,11 +158,11 @@ def _setup_solana():
     escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
     if escrow_ready:
         try:
-            solana_client = Client(SOLANA_RPC)
-            mint_pubkey = Pubkey.from_string(IFC_MINT)
             treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
-            treasury_ata = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
-            logger.info("ESCROW LIVE - Treasury: %s", treasury_kp.pubkey())
+            _ta = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
+            # Ensure solders Pubkey type
+            treasury_ata = _ta if isinstance(_ta, Pubkey) else Pubkey.from_string(str(_ta))
+            logger.info("ESCROW LIVE - Treasury: %s, ATA: %s", treasury_kp.pubkey(), treasury_ata)
         except Exception as e:
             logger.error("Solana init failed: %s", e)
             escrow_ready = False
@@ -170,6 +188,8 @@ def get_wallet_balance(wallet_address):
         from solders.pubkey import Pubkey
         recipient_pk = Pubkey.from_string(wallet_address)
         recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
+        if not isinstance(recipient_ata, Pubkey):
+            recipient_ata = Pubkey.from_string(str(recipient_ata))
         resp = solana_client.get_token_account_balance(recipient_ata)
         if hasattr(resp, 'value') and resp.value:
             return float(resp.value.ui_amount or 0)
@@ -196,7 +216,6 @@ def transfer_ifc(recipient, amount):
         from solders.pubkey import Pubkey
         from solders.instruction import Instruction, AccountMeta
         from solders.transaction import Transaction as SoldersTx
-        from solders.message import Message
         from solders.hash import Hash
 
         amount_raw = int(amount * 1_000_000)
@@ -216,9 +235,8 @@ def transfer_ifc(recipient, amount):
         instructions = []
 
         if not ata_exists:
-            # Create ATA instruction (needs Rent sysvar too)
+            # Build ATA creation WITHOUT Rent sysvar (current mainnet ATA program doesn't need it)
             sys_prog = Pubkey.from_string("11111111111111111111111111111111")
-            rent_sysvar = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
             create_ix = Instruction(
                 program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
                 accounts=[
@@ -228,13 +246,12 @@ def transfer_ifc(recipient, amount):
                     AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
                     AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
                     AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                    AccountMeta(pubkey=rent_sysvar, is_signer=False, is_writable=False),
                 ],
                 data=b""
             )
             instructions.append(create_ix)
 
-        # TransferChecked instruction (program index 12, 6 decimals)
+        # TransferChecked instruction (index 12, 6 decimals)
         ix_data = struct.pack("<BQB", 12, amount_raw, 6)
         transfer_ix = Instruction(
             program_id=TOKEN_PROGRAM_ID,
@@ -248,7 +265,7 @@ def transfer_ifc(recipient, amount):
         )
         instructions.append(transfer_ix)
 
-        # Build & send via raw RPC using solders types only
+        # Get blockhash
         bh_resp = requests.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getLatestBlockhash",
@@ -256,8 +273,13 @@ def transfer_ifc(recipient, amount):
         }, timeout=10).json()
         blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
 
-        msg = Message.new_with_blockhash(instructions, treasury_kp.pubkey(), blockhash)
-        tx = SoldersTx([treasury_kp], msg, blockhash)
+        # Build properly signed transaction using solders official constructor
+        tx = SoldersTx.new_signed_with_payer(
+            instructions,
+            treasury_kp.pubkey(),
+            [treasury_kp],
+            blockhash
+        )
         tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
 
         send_resp = requests.post(SOLANA_RPC, json={
@@ -269,7 +291,9 @@ def transfer_ifc(recipient, amount):
         if 'result' in send_resp:
             return {"success": True, "tx": send_resp['result'], "message": f"Sent {amount:,} INFINITE"}
         else:
-            return {"success": False, "tx": None, "message": f"RPC error: {send_resp.get('error', 'unknown')}"}
+            err = send_resp.get('error', 'unknown')
+            logger.error("RPC send error: %s", err)
+            return {"success": False, "tx": None, "message": f"RPC error: {err}"}
 
     except Exception as e:
         logger.error("Transfer error: %s", e)
@@ -456,7 +480,7 @@ def wallet_callback():
             return '<h1>Wallet Already Linked</h1><p>This wallet is connected to another account.</p>'
         user_db.setdefault(uid, {})["wallet"] = wallet
         return redirect(f"{GAME_URL}?user_id={uid}&wallet={wallet}")
-    return '<h1>Connect Wallet</h1><form>...</form>'  # simplified
+    return '<h1>Connect Wallet</h1><form>...</form>'
 
 @app.route("/api/wallet", methods=["POST"])
 def api_wallet():
