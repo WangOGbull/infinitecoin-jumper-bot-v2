@@ -55,12 +55,51 @@ DAILY_BONUS_AMOUNT = 500
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
 
-user_db = {}
-earnings_db = {}
-escrow_db = {}
-daily_bonus_db = {}
+USER_DB_FILE = os.path.join(os.path.dirname(__file__), "user_db.json")
+EARNINGS_DB_FILE = os.path.join(os.path.dirname(__file__), "earnings_db.json")
+ESCROW_DB_FILE = os.path.join(os.path.dirname(__file__), "escrow_db.json")
+DAILY_DB_FILE = os.path.join(os.path.dirname(__file__), "daily_db.json")
+
+def _load_json_file(path, default=None):
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error("Failed to load %s: %s", path, e)
+    return default if default is not None else {}
+
+def _save_json_file(path, data):
+    try:
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error("Failed to save %s: %s", path, e)
+
+user_db = _load_json_file(USER_DB_FILE)
+earnings_db = _load_json_file(EARNINGS_DB_FILE)
+escrow_db = _load_json_file(ESCROW_DB_FILE)
+daily_bonus_db = _load_json_file(DAILY_DB_FILE)
 # ========== LEADERBOARD DATABASE ==========
-high_scores_db = {}  # {wallet_address: {"best_distance": int, "username": str, "last_updated": timestamp}}
+HIGH_SCORES_FILE = os.path.join(os.path.dirname(__file__), "high_scores.json")
+
+def _load_high_scores():
+    if os.path.exists(HIGH_SCORES_FILE):
+        try:
+            with open(HIGH_SCORES_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error("Failed to load high scores: %s", e)
+    return {}
+
+def _save_high_scores():
+    try:
+        with open(HIGH_SCORES_FILE, 'w') as f:
+            json.dump(high_scores_db, f, indent=2)
+    except Exception as e:
+        logger.error("Failed to save high scores: %s", e)
+
+high_scores_db = _load_high_scores()  # {wallet_address: {"best_distance": int, "username": str, "last_updated": timestamp}}
 
 # ========== WALLET UNIQUENESS ==========
 def _get_uid_by_wallet(wallet_address):
@@ -306,11 +345,13 @@ def get_escrow_remaining_hours(uid):
 
 def start_escrow(uid, amount):
     escrow_db[str(uid)] = {"hold_time": int(time.time() * 1000), "amount": amount, "released": False}
+    _save_json_file(ESCROW_DB_FILE, escrow_db)
 
 def clear_escrow(uid):
     if str(uid) in escrow_db:
         escrow_db[str(uid)]["released"] = True
         escrow_db[str(uid)]["amount"] = 0
+        _save_json_file(ESCROW_DB_FILE, escrow_db)
 
 def is_daily_available(uid):
     last = daily_bonus_db.get(str(uid), 0)
@@ -384,6 +425,7 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_set:
         await update.message.reply_text("Wallet already linked to another account!"); return
     user_db.setdefault(uid, {})["wallet"] = wallet
+    _save_json_file(USER_DB_FILE, user_db)
     await update.message.reply_text(f"Wallet saved! Now /claim or /balance.", parse_mode="Markdown")
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,6 +510,7 @@ def wallet_callback():
         if not can_set:
             return '<h1>Wallet Already Linked</h1><p>This wallet is connected to another account.</p>'
         user_db.setdefault(uid, {})["wallet"] = wallet
+        _save_json_file(USER_DB_FILE, user_db)
         return redirect(f"{GAME_URL}?user_id={uid}&wallet={wallet}")
     return '<h1>Connect Wallet</h1><form>...</form>'
 
@@ -482,6 +525,7 @@ def api_wallet():
     if not can_set:
         return jsonify({"error": "Wallet already linked"}), 409
     user_db.setdefault(uid, {})["wallet"] = wallet
+    _save_json_file(USER_DB_FILE, user_db)
     return jsonify({"success": True})
 
 @app.route("/api/earnings", methods=["POST"])
@@ -492,6 +536,7 @@ def api_earnings():
     if not uid: return jsonify({"error": "Missing user_id"}), 400
     _, e, _, _ = get_db(uid)
     e["total_earned"] += amount; e["unclaimed"] += amount
+    _save_json_file(EARNINGS_DB_FILE, earnings_db)
     return jsonify({"success": True, "unclaimed": e["unclaimed"]})
 
 @app.route("/api/claim", methods=["POST"])
@@ -502,6 +547,10 @@ def api_claim():
     amount = int(data.get("amount", 0))
     if not uid or not wallet or amount <= 0: return jsonify({"error": "Invalid"}), 400
     result = transfer_ifc(wallet, amount)
+    if result.get('success'):
+        _, e, _, _ = get_db(uid)
+        e['total_claimed'] += amount; e['unclaimed'] = max(0, e['unclaimed'] - amount)
+        _save_json_file(EARNINGS_DB_FILE, earnings_db)
     return jsonify(result)
 
 @app.route("/api/daily", methods=["POST"])
@@ -512,7 +561,12 @@ def api_daily():
     if not uid: return jsonify({"error": "Missing"}), 400
     if not is_daily_available(uid): return jsonify({"success": False, "message": "Cooldown"})
     daily_bonus_db[uid] = int(time.time() * 1000)
+    _save_json_file(DAILY_DB_FILE, daily_bonus_db)
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
+    if result.get('success'):
+        _, e, _, _ = get_db(uid)
+        e['total_earned'] += DAILY_BONUS_AMOUNT; e['total_claimed'] += DAILY_BONUS_AMOUNT
+        _save_json_file(EARNINGS_DB_FILE, earnings_db)
     return jsonify({"success": True, "tx": result.get("tx", ""), "transferred": result.get("success", False)})
 
 @app.route("/api/balance/<uid>", methods=["GET"])
@@ -544,6 +598,7 @@ def api_score():
             "username": username,
             "last_updated": time.time()
         }
+        _save_high_scores()
         return jsonify({"success": True, "new_record": True, "best_distance": distance})
     return jsonify({"success": True, "new_record": False, "best_distance": existing.get("best_distance", 0)})
 
