@@ -1,6 +1,7 @@
 """
 Infinitecoin Jumper Bot - Production Ready
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
+Leaderboard + High Score support added.
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct
 from datetime import datetime, timezone
@@ -58,6 +59,8 @@ user_db = {}
 earnings_db = {}
 escrow_db = {}
 daily_bonus_db = {}
+# ========== LEADERBOARD DATABASE ==========
+high_scores_db = {}  # {wallet_address: {"best_distance": int, "username": str, "last_updated": timestamp}}
 
 # ========== WALLET UNIQUENESS ==========
 def _get_uid_by_wallet(wallet_address):
@@ -105,7 +108,6 @@ def _setup_solana():
         logger.error("solana.rpc not found: %s", e)
         return
 
-    # Program IDs
     DEFAULT_TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
     TOKEN_2022_PROGRAM = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
     ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
@@ -113,7 +115,6 @@ def _setup_solana():
     solana_client = Client(SOLANA_RPC)
     mint_pubkey = Pubkey.from_string(IFC_MINT)
 
-    # Detect actual token program from mint owner
     try:
         mint_info = solana_client.get_account_info(mint_pubkey)
         if hasattr(mint_info, 'value') and mint_info.value:
@@ -131,7 +132,6 @@ def _setup_solana():
         logger.warning("Mint owner detection failed, defaulting to standard: %s", e)
         TOKEN_PROGRAM_ID = DEFAULT_TOKEN_PROGRAM
 
-    # Try SPL library
     try:
         from spl.token.instructions import (
             create_associated_token_account_idempotent as _cati,
@@ -160,7 +160,6 @@ def _setup_solana():
         try:
             treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
             _ta = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
-            # Ensure solders Pubkey type
             treasury_ata = _ta if isinstance(_ta, Pubkey) else Pubkey.from_string(str(_ta))
             logger.info("ESCROW LIVE - Treasury: %s, ATA: %s", treasury_kp.pubkey(), treasury_ata)
         except Exception as e:
@@ -205,10 +204,6 @@ def has_minimum_balance(wallet_address):
 
 # ========== REAL TOKEN TRANSFER ==========
 def transfer_ifc(recipient, amount):
-    """
-    Send real INFINITE from treasury to player.
-    Auto-creates player ATA if missing.
-    """
     if not escrow_ready:
         return {"success": False, "tx": None, "message": "Treasury not ready"}
 
@@ -221,11 +216,9 @@ def transfer_ifc(recipient, amount):
         amount_raw = int(amount * 1_000_000)
         recipient_pk = Pubkey.from_string(recipient.strip())
 
-        # Derive recipient ATA
         seeds = [bytes(recipient_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
         recipient_ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
 
-        # Check if ATA exists
         acct_info = solana_client.get_account_info(recipient_ata)
         if hasattr(acct_info, 'value'):
             ata_exists = acct_info.value is not None
@@ -235,7 +228,6 @@ def transfer_ifc(recipient, amount):
         instructions = []
 
         if not ata_exists:
-            # Build ATA creation WITHOUT Rent sysvar (current mainnet ATA program doesn't need it)
             sys_prog = Pubkey.from_string("11111111111111111111111111111111")
             create_ix = Instruction(
                 program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -251,7 +243,6 @@ def transfer_ifc(recipient, amount):
             )
             instructions.append(create_ix)
 
-        # TransferChecked instruction (index 12, 6 decimals)
         ix_data = struct.pack("<BQB", 12, amount_raw, 6)
         transfer_ix = Instruction(
             program_id=TOKEN_PROGRAM_ID,
@@ -265,7 +256,6 @@ def transfer_ifc(recipient, amount):
         )
         instructions.append(transfer_ix)
 
-        # Get blockhash
         bh_resp = requests.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getLatestBlockhash",
@@ -273,7 +263,6 @@ def transfer_ifc(recipient, amount):
         }, timeout=10).json()
         blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
 
-        # Build properly signed transaction using solders official constructor
         tx = SoldersTx.new_signed_with_payer(
             instructions,
             treasury_kp.pubkey(),
@@ -535,6 +524,60 @@ def api_get_balance(uid):
         bal = has_minimum_balance(wallet)
         result.update({"wallet_balance": bal['balance'], "can_claim": True})
     return jsonify(result)
+
+# ========== LEADERBOARD ROUTES ==========
+@app.route("/api/score", methods=["POST"])
+def api_score():
+    """Save player's best distance. Wallet address is the unique ID."""
+    data = request.get_json() or {}
+    wallet = data.get("wallet_address", "").strip()
+    distance = int(data.get("distance", 0))
+    username = data.get("username", "Anonymous")
+    
+    if not wallet or len(wallet) < 32 or distance < 0:
+        return jsonify({"error": "Invalid"}), 400
+    
+    existing = high_scores_db.get(wallet, {"best_distance": 0})
+    if distance > existing.get("best_distance", 0):
+        high_scores_db[wallet] = {
+            "best_distance": distance,
+            "username": username,
+            "last_updated": time.time()
+        }
+        return jsonify({"success": True, "new_record": True, "best_distance": distance})
+    return jsonify({"success": True, "new_record": False, "best_distance": existing.get("best_distance", 0)})
+
+@app.route("/api/leaderboard", methods=["GET"])
+def api_leaderboard():
+    """Return top 10 players by distance."""
+    sorted_scores = sorted(
+        high_scores_db.items(),
+        key=lambda x: x[1].get("best_distance", 0),
+        reverse=True
+    )[:10]
+    
+    leaderboard = []
+    for rank, (wallet, data) in enumerate(sorted_scores, 1):
+        leaderboard.append({
+            "rank": rank,
+            "wallet": wallet[:4] + "..." + wallet[-4:],
+            "full_wallet": wallet,
+            "username": data.get("username", "Anonymous"),
+            "distance": data.get("best_distance", 0)
+        })
+    return jsonify({"leaderboard": leaderboard, "total_players": len(high_scores_db)})
+
+@app.route("/api/highscore/<wallet>", methods=["GET"])
+def api_highscore(wallet):
+    """Get personal best for a wallet."""
+    w = wallet.strip()
+    if not w or len(w) < 32:
+        return jsonify({"error": "Invalid wallet"}), 400
+    data = high_scores_db.get(w, {"best_distance": 0, "username": "Anonymous"})
+    return jsonify({
+        "best_distance": data.get("best_distance", 0),
+        "username": data.get("username", "Anonymous")
+    })
 
 @app.route("/setup-webhook")
 def setup_webhook():
