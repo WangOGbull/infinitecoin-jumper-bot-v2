@@ -1,9 +1,7 @@
 """
-Infinitecoin Jumper Bot - Simple Treasury Protection
-Rules:
-1. Everyone: 25K IFC max per 24h claim
-2. First-time whale (100K+ unclaimed): 25% of balance, max 150K
-3. After whale bonus: back to 25K/day
+Infinitecoin Jumper Bot - Production Ready
+No minimum balance required for claims. Real INFINITE token transfers from treasury.
+Leaderboard + High Score support added.
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct
 from datetime import datetime, timezone
@@ -23,21 +21,15 @@ IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjm
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-# ========== SIMPLE CAPS ==========
-NORMAL_CAP = 25000          # Everyone: 25K/day
-WHALE_THRESHOLD = 100000    # 100K+ = whale
-WHALE_PERCENT = 0.25        # 25% first claim
-WHALE_MAX = 150000          # Max 150K whale claim
-COOLDOWN_HOURS = 24         # 24h between claims
-
-# Token price from DexScreener
+# Token price fetched live from DexScreener
 IFC_PRICE_USD = None
 _last_price_fetch = 0
+_price_cache_seconds = 300
 
 def get_token_price():
     global IFC_PRICE_USD, _last_price_fetch
     now = time.time()
-    if IFC_PRICE_USD is not None and (now - _last_price_fetch) < 300:
+    if IFC_PRICE_USD is not None and (now - _last_price_fetch) < _price_cache_seconds:
         return IFC_PRICE_USD
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{IFC_MINT}"
@@ -49,61 +41,47 @@ def get_token_price():
             if price > 0:
                 IFC_PRICE_USD = price
                 _last_price_fetch = now
+                logger.info("DexScreener price: $%.8f", IFC_PRICE_USD)
                 return IFC_PRICE_USD
     except Exception as e:
-        logger.error("Price fetch error: %s", e)
+        logger.error("DexScreener failed: %s", e)
     if IFC_PRICE_USD is None:
         IFC_PRICE_USD = 0.00000329
     return IFC_PRICE_USD
 
-DAILY_BONUS_AMOUNT = 500
 ESCROW_HOURS = 24
+DAILY_BONUS_AMOUNT = 500
+
+# ========== SIMPLE CLAIM CAPS ==========
+NORMAL_CAP = 25000
+WHALE_THRESHOLD = 100000
+WHALE_PERCENT = 0.25
+WHALE_MAX = 150000
+CLAIM_COOLDOWN = 24
 
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
 
-# ========== FILE STORAGE ==========
-DATA_DIR = os.path.dirname(__file__) or "."
+user_db = {}
+earnings_db = {}
+escrow_db = {}
+daily_bonus_db = {}
+# ========== LEADERBOARD DATABASE ==========
+high_scores_db = {}  # {wallet_address: {"best_distance": int, "username": str, "last_updated": timestamp}}
 
-def _load_json(path, default=None):
-    if os.path.exists(path):
-        try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error("Load failed %s: %s", path, e)
-    return default if default is not None else {}
+# ========== WALLET UNIQUENESS ==========
+def _get_uid_by_wallet(wallet_address):
+    w = wallet_address.strip()
+    for uid, data in user_db.items():
+        if data.get("wallet", "").strip() == w:
+            return uid
+    return None
 
-def _save_json(path, data):
-    try:
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error("Save failed %s: %s", path, e)
-
-USER_DB_FILE = os.path.join(DATA_DIR, "user_db.json")
-EARNINGS_DB_FILE = os.path.join(DATA_DIR, "earnings_db.json")
-ESCROW_DB_FILE = os.path.join(DATA_DIR, "escrow_db.json")
-DAILY_DB_FILE = os.path.join(DATA_DIR, "daily_db.json")
-HIGH_SCORES_FILE = os.path.join(DATA_DIR, "high_scores.json")
-
-def get_db(user_id):
-    uid = str(user_id)
-    user_db.setdefault(uid, {})
-    earnings_db.setdefault(uid, {
-        "total_earned": 0, "unclaimed": 0, "total_claimed": 0,
-        "last_claim_time": 0, "used_whale_bonus": False,
-        "daily_claimed": {}
-    })
-    escrow_db.setdefault(uid, {"hold_time": 0, "amount": 0, "released": True})
-    daily_bonus_db.setdefault(uid, 0)
-    return user_db[uid], earnings_db[uid], escrow_db[uid], daily_bonus_db[uid]
-
-user_db = _load_json(USER_DB_FILE, {})
-earnings_db = _load_json(EARNINGS_DB_FILE, {})
-escrow_db = _load_json(ESCROW_DB_FILE, {})
-daily_bonus_db = _load_json(DAILY_DB_FILE, {})
-high_scores_db = _load_json(HIGH_SCORES_FILE, {})
+def _can_set_wallet(uid, wallet_address):
+    existing_uid = _get_uid_by_wallet(wallet_address)
+    if existing_uid is not None and existing_uid != str(uid):
+        return False, existing_uid
+    return True, None
 
 # ========== SOLANA SETUP ==========
 escrow_ready = False
@@ -111,25 +89,30 @@ solana_client = None
 mint_pubkey = None
 treasury_kp = None
 treasury_ata = None
+create_associated_token_account_idempotent = None
 get_associated_token_address = None
+transfer_checked = None
+TransferCheckedParams = None
 TOKEN_PROGRAM_ID = None
 ASSOCIATED_TOKEN_PROGRAM_ID = None
 
 def _setup_solana():
     global escrow_ready, solana_client, mint_pubkey, treasury_kp, treasury_ata
-    global get_associated_token_address, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+    global create_associated_token_account_idempotent, get_associated_token_address
+    global transfer_checked, TransferCheckedParams
+    global TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
 
     try:
         from solders.pubkey import Pubkey
         from solders.keypair import Keypair
-    except ImportError:
-        logger.error("solders not installed")
+    except ImportError as e:
+        logger.error("solders not installed: %s", e)
         return
 
     try:
         from solana.rpc.api import Client
-    except ImportError:
-        logger.error("solana.rpc not found")
+    except ImportError as e:
+        logger.error("solana.rpc not found: %s", e)
         return
 
     DEFAULT_TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -145,19 +128,39 @@ def _setup_solana():
             mint_owner = str(mint_info.value.owner)
         else:
             mint_owner = mint_info.get('result', {}).get('value', {}).get('owner')
-        TOKEN_PROGRAM_ID = TOKEN_2022_PROGRAM if mint_owner == str(TOKEN_2022_PROGRAM) else DEFAULT_TOKEN_PROGRAM
-    except Exception:
+        
+        if mint_owner == str(TOKEN_2022_PROGRAM):
+            TOKEN_PROGRAM_ID = TOKEN_2022_PROGRAM
+            logger.info("Detected Token-2022 program for mint")
+        else:
+            TOKEN_PROGRAM_ID = DEFAULT_TOKEN_PROGRAM
+            logger.info("Detected standard SPL Token program for mint: %s", mint_owner)
+    except Exception as e:
+        logger.warning("Mint owner detection failed, defaulting to standard: %s", e)
         TOKEN_PROGRAM_ID = DEFAULT_TOKEN_PROGRAM
 
     try:
-        from spl.token.instructions import get_associated_token_address as _gata
+        from spl.token.instructions import (
+            create_associated_token_account_idempotent as _cati,
+            get_associated_token_address as _gata,
+            transfer_checked as _tc,
+            TransferCheckedParams as _tcp,
+        )
+        create_associated_token_account_idempotent = _cati
         get_associated_token_address = _gata
+        transfer_checked = _tc
+        TransferCheckedParams = _tcp
+        logger.info("SPL library loaded")
     except ImportError:
         def _gata_fallback(owner, mint):
             seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
             result = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
             return result[0]
         get_associated_token_address = _gata_fallback
+        create_associated_token_account_idempotent = None
+        transfer_checked = None
+        TransferCheckedParams = None
+        logger.info("Using SPL fallback")
 
     escrow_ready = bool(TREASURY_KEY and get_associated_token_address)
     if escrow_ready:
@@ -165,7 +168,7 @@ def _setup_solana():
             treasury_kp = Keypair.from_base58_string(TREASURY_KEY)
             _ta = get_associated_token_address(treasury_kp.pubkey(), mint_pubkey)
             treasury_ata = _ta if isinstance(_ta, Pubkey) else Pubkey.from_string(str(_ta))
-            logger.info("ESCROW LIVE: %s", treasury_kp.pubkey())
+            logger.info("ESCROW LIVE - Treasury: %s, ATA: %s", treasury_kp.pubkey(), treasury_ata)
         except Exception as e:
             logger.error("Solana init failed: %s", e)
             escrow_ready = False
@@ -174,18 +177,27 @@ def _setup_solana():
 
 _setup_solana()
 
-def get_treasury_balance():
-    if not escrow_ready: return 0
-    try:
-        resp = solana_client.get_token_account_balance(treasury_ata)
-        if hasattr(resp, 'value') and resp.value:
-            return float(resp.value.ui_amount or 0)
-        return 0
-    except Exception:
-        return 0
+# ========== DATABASE ==========
+def calculate_claimable(unclaimed, used_whale_bonus):
+    if used_whale_bonus:
+        return min(unclaimed, NORMAL_CAP)
+    if unclaimed >= WHALE_THRESHOLD:
+        whale_amount = int(unclaimed * WHALE_PERCENT)
+        return min(whale_amount, WHALE_MAX)
+    return min(unclaimed, NORMAL_CAP)
 
+def get_db(user_id):
+    uid = str(user_id)
+    user_db.setdefault(uid, {})
+    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0})
+    escrow_db.setdefault(uid, {"hold_time": 0, "amount": 0, "released": True})
+    daily_bonus_db.setdefault(uid, 0)
+    return user_db[uid], earnings_db[uid], escrow_db[uid], daily_bonus_db[uid]
+
+# ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
-    if not escrow_ready: return 0
+    if not escrow_ready or not get_associated_token_address:
+        return 0
     try:
         from solders.pubkey import Pubkey
         recipient_pk = Pubkey.from_string(wallet_address)
@@ -196,12 +208,20 @@ def get_wallet_balance(wallet_address):
         if hasattr(resp, 'value') and resp.value:
             return float(resp.value.ui_amount or 0)
         return 0
-    except Exception:
+    except Exception as e:
+        logger.error("Balance check error: %s", e)
         return 0
 
+def has_minimum_balance(wallet_address):
+    balance = get_wallet_balance(wallet_address)
+    usd_value = balance * get_token_price()
+    return {"has_min": True, "balance": balance, "usd_value": usd_value}
+
+# ========== REAL TOKEN TRANSFER ==========
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
         return {"success": False, "tx": None, "message": "Treasury not ready"}
+
     try:
         from solders.pubkey import Pubkey
         from solders.instruction import Instruction, AccountMeta
@@ -210,6 +230,7 @@ def transfer_ifc(recipient, amount):
 
         amount_raw = int(amount * 1_000_000)
         recipient_pk = Pubkey.from_string(recipient.strip())
+
         seeds = [bytes(recipient_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
         recipient_ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
 
@@ -220,6 +241,7 @@ def transfer_ifc(recipient, amount):
             ata_exists = acct_info.get('result', {}).get('value') is not None
 
         instructions = []
+
         if not ata_exists:
             sys_prog = Pubkey.from_string("11111111111111111111111111111111")
             create_ix = Instruction(
@@ -256,7 +278,12 @@ def transfer_ifc(recipient, amount):
         }, timeout=10).json()
         blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
 
-        tx = SoldersTx.new_signed_with_payer(instructions, treasury_kp.pubkey(), [treasury_kp], blockhash)
+        tx = SoldersTx.new_signed_with_payer(
+            instructions,
+            treasury_kp.pubkey(),
+            [treasury_kp],
+            blockhash
+        )
         tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
 
         send_resp = requests.post(SOLANA_RPC, json={
@@ -268,73 +295,78 @@ def transfer_ifc(recipient, amount):
         if 'result' in send_resp:
             return {"success": True, "tx": send_resp['result'], "message": f"Sent {amount:,} INFINITE"}
         else:
-            return {"success": False, "tx": None, "message": f"RPC error: {send_resp.get('error', 'unknown')}"}
+            err = send_resp.get('error', 'unknown')
+            logger.error("RPC send error: %s", err)
+            return {"success": False, "tx": None, "message": f"RPC error: {err}"}
+
     except Exception as e:
+        logger.error("Transfer error: %s", e)
         return {"success": False, "tx": None, "message": str(e)}
 
-# ========== CLAIM LOGIC ==========
-def calculate_claimable(unclaimed, used_whale_bonus):
-    """Simple 3-rule system."""
-    # Rule 3: Already used whale bonus = normal cap
-    if used_whale_bonus:
-        return min(unclaimed, NORMAL_CAP)
-
-    # Rule 2: First time + 100K+ = whale bonus (25%, max 150K)
-    if unclaimed >= WHALE_THRESHOLD:
-        whale_amount = int(unclaimed * WHALE_PERCENT)
-        return min(whale_amount, WHALE_MAX)
-
-    # Rule 1: Normal player
-    return min(unclaimed, NORMAL_CAP)
-
+# ========== ESCROW LOGIC ==========
 def is_escrow_active(uid):
     e = escrow_db.get(str(uid), {})
     if not e or e.get("amount", 0) <= 0:
         return False
-    hours = (time.time() * 1000 - e.get("hold_time", 0)) / (1000 * 60 * 60)
-    return hours < ESCROW_HOURS and not e.get("released", True)
+    hours_elapsed = (time.time() * 1000 - e.get("hold_time", 0)) / (1000 * 60 * 60)
+    return hours_elapsed < ESCROW_HOURS and not e.get("released", True)
 
-def get_escrow_remaining(uid):
+def get_escrow_remaining_hours(uid):
     e = escrow_db.get(str(uid), {})
-    if not e.get("hold_time"): return 0
-    elapsed = time.time() * 1000 - e["hold_time"]
-    remaining = (ESCROW_HOURS * 60 * 60 * 1000) - elapsed
-    return max(0, remaining / (1000 * 60 * 60))
+    if not e.get("hold_time"):
+        return 0
+    elapsed_ms = time.time() * 1000 - e["hold_time"]
+    remaining_ms = (ESCROW_HOURS * 60 * 60 * 1000) - elapsed_ms
+    return max(0, remaining_ms / (1000 * 60 * 60))
+
+def start_escrow(uid, amount):
+    escrow_db[str(uid)] = {"hold_time": int(time.time() * 1000), "amount": amount, "released": False}
+
+def clear_escrow(uid):
+    if str(uid) in escrow_db:
+        escrow_db[str(uid)]["released"] = True
+        escrow_db[str(uid)]["amount"] = 0
 
 def is_daily_available(uid):
     last = daily_bonus_db.get(str(uid), 0)
-    if not last: return True
-    return (time.time() * 1000 - last) / (1000 * 60 * 60) >= 24
+    if not last:
+        return True
+    hours_since = (time.time() * 1000 - last) / (1000 * 60 * 60)
+    return hours_since >= 24
+
+def get_daily_remaining_text(uid):
+    last = daily_bonus_db.get(str(uid), 0)
+    if not last:
+        return "Available now!"
+    elapsed_ms = time.time() * 1000 - last
+    remaining_ms = (24 * 60 * 60 * 1000) - elapsed_ms
+    if remaining_ms <= 0:
+        return "Available now!"
+    hours = int(remaining_ms / (1000 * 60 * 60))
+    mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
+    return f"{hours}h {mins}m"
 
 # ========== TELEGRAM HANDLERS ==========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
-    _, e, _, _ = get_db(uid)
+    _, e, esc, _ = get_db(uid)
     wallet = user_db.get(uid, {}).get("wallet")
     wallet_text = f"`{wallet[:4]}...{wallet[-4:]}`" if wallet else "*Not connected*"
-
-    # Whale bonus status
-    whale_msg = ""
-    if not e.get("used_whale_bonus") and e["unclaimed"] >= WHALE_THRESHOLD:
-        whale_amount = min(int(e["unclaimed"] * WHALE_PERCENT), WHALE_MAX)
-        whale_msg = f"
-🎉 Whale bonus available: {whale_amount:,} IFC!"
-
-    lines = [
-        "*Infinitecoin Jumper*",
+    status_lines = [
+        "*Infinitecoin Jumper*", "_Collect coins. Avoid viruses. Earn INFINITE._", "",
         f"Wallet: {wallet_text}",
         f"Earned: {e['total_earned']:,} INFINITE",
         f"Unclaimed: {e['unclaimed']:,} INFINITE",
-        whale_msg,
-        f"
-📅 Daily cap: {NORMAL_CAP:,} IFC",
-        f"🐋 Whale threshold: {WHALE_THRESHOLD:,} IFC",
-        f"
-/play /wallet /claim /daily /balance"
     ]
-    await update.message.reply_text("
-".join(lines), parse_mode="Markdown",
+    if is_escrow_active(uid):
+        esc_data = escrow_db.get(uid, {})
+        remaining = get_escrow_remaining_hours(uid)
+        status_lines.append(f"Escrow: {esc_data.get('amount', 0):,} INFINITE ({remaining:.1f}h left)")
+    status_lines.extend(["", "/play - Launch game", "/wallet - Connect Phantom",
+        "/balance - Check INFINITE & balance", "/claim - Claim INFINITE",
+        "/daily - Daily bonus (500 INFINITE)", "/help - How to play"])
+    await update.message.reply_text("\n".join(status_lines), parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Play Game", url=f"{GAME_URL}?user_id={uid}")],
             [InlineKeyboardButton("Connect Wallet", callback_data="wallet")],
@@ -349,11 +381,11 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     existing = get_db(uid)[0].get("wallet")
     if existing:
-        await update.message.reply_text(f"Wallet: `{existing[:4]}...{existing[-4:]}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"Wallet connected: `{existing[:4]}...{existing[-4:]}`\nUse /balance or /claim.", parse_mode="Markdown")
         return
     phantom_url = f"https://phantom.app/ul/v1/connect?app_url={BASE_URL}&redirect_link={BASE_URL}/wallet-callback?user_id={uid}"
-    await update.message.reply_text("*Connect Phantom*
-Or: `/setwallet ADDRESS`",
+    await update.message.reply_text("*Connect Phantom*\n1. Open Phantom\n2. Approve\n3. Return\n\nOr: `/setwallet ADDRESS`",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Phantom", url=phantom_url)]]))
 
 async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,9 +395,11 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet = context.args[0].strip()
     if len(wallet) < 32:
         await update.message.reply_text("Invalid address."); return
+    can_set, _ = _can_set_wallet(uid, wallet)
+    if not can_set:
+        await update.message.reply_text("Wallet already linked to another account!"); return
     user_db.setdefault(uid, {})["wallet"] = wallet
-    _save_json(USER_DB_FILE, user_db)
-    await update.message.reply_text("Wallet saved! Now /claim or /balance.", parse_mode="Markdown")
+    await update.message.reply_text(f"Wallet saved! Now /claim or /balance.", parse_mode="Markdown")
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
@@ -373,84 +407,47 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     e = get_db(uid)[1]
     lines = ["*Your INFINITE Status*"]
     if wallet:
-        bal = get_wallet_balance(wallet)
-        lines.append(f"Balance: {bal:,.2f} INFINITE")
-    lines.extend([
-        f"Earned: {e['total_earned']:,}",
-        f"Unclaimed: {e['unclaimed']:,}",
-        f"Claimed: {e['total_claimed']:,}",
-        f"
-Daily cap: {NORMAL_CAP:,} IFC",
-        f"Whale bonus: {'Used' if e.get('used_whale_bonus') else 'Available'}"
-    ])
-    await update.message.reply_text("
-".join(lines), parse_mode="Markdown")
+        lines.append(f"Wallet: `{wallet[:4]}...{wallet[-4:]}`")
+        bal = has_minimum_balance(wallet)
+        lines.append(f"Balance: {bal['balance']:,.2f} INFINITE (${bal['usd_value']:.6f})")
+        lines.append("Status: *Ready to claim*")
+    else:
+        lines.append("Wallet: *Not connected*")
+    lines.extend([f"Earned: {e['total_earned']:,} INFINITE", f"Unclaimed: {e['unclaimed']:,} INFINITE",
+        f"Claimed: {e['total_claimed']:,} INFINITE", f"\nDaily: {get_daily_remaining_text(uid)}", "\n/play to earn!"])
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     wallet = get_db(uid)[0].get("wallet")
     e = get_db(uid)[1]
-
     if not wallet:
         await update.message.reply_text("No wallet! Use /wallet first."); return
     if e['unclaimed'] <= 0:
         await update.message.reply_text("No INFINITE to claim. /play to earn!"); return
-
-    # 24h cooldown check
-    last_claim = e.get("last_claim_time", 0)
-    hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
-    if hours_since < COOLDOWN_HOURS:
-        remaining = COOLDOWN_HOURS - hours_since
-        await update.message.reply_text(f"Cooldown: {remaining:.1f}h remaining."); return
-
-    # Calculate claimable
-    claimable = calculate_claimable(e['unclaimed'], e.get("used_whale_bonus", False))
-
-    if claimable <= 0:
-        await update.message.reply_text("Nothing to claim."); return
-
-    result = transfer_ifc(wallet, claimable)
-
-    if result.get('success'):
-        e['total_claimed'] += claimable
-        e['unclaimed'] -= claimable
-        e["last_claim_time"] = int(time.time() * 1000)
-
-        # Mark whale bonus used if this was a whale claim
-        if claimable > NORMAL_CAP:
-            e["used_whale_bonus"] = True
-
-        _save_json(EARNINGS_DB_FILE, earnings_db)
-
-        msg = f"Claimed {claimable:,} INFINITE!"
-        if claimable > NORMAL_CAP:
-            msg += f"
-🎉 Whale bonus applied!"
-        msg += f"
-Tx: `{result.get('tx', 'N/A')}`"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"Claim failed: {result.get('message')}")
+    result = transfer_ifc(wallet, e['unclaimed'])
+    if result['success']:
+        e['total_claimed'] += e['unclaimed']; e['unclaimed'] = 0
+    await update.message.reply_text(f"{'Claimed' if result['success'] else 'Failed'}: {result['message']}\nTx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
 
 async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     wallet = get_db(uid)[0].get("wallet")
+    e = get_db(uid)[1]
     if not is_daily_available(uid):
-        await update.message.reply_text("Daily bonus on cooldown."); return
+        await update.message.reply_text(f"Cooldown. Next: {get_daily_remaining_text(uid)}"); return
     daily_bonus_db[uid] = int(time.time() * 1000)
-    _save_json(DAILY_DB_FILE, daily_bonus_db)
     tx = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
     if tx.get('success'):
-        _, e, _, _ = get_db(uid)
         e['total_earned'] += DAILY_BONUS_AMOUNT; e['total_claimed'] += DAILY_BONUS_AMOUNT
-        _save_json(EARNINGS_DB_FILE, earnings_db)
-        await update.message.reply_text(f"DAILY BONUS! +{DAILY_BONUS_AMOUNT:,} INFINITE!
-Tx: `{tx.get('tx')}`", parse_mode="Markdown")
+        await update.message.reply_text(f"DAILY BONUS! +{DAILY_BONUS_AMOUNT:,} INFINITE!\nTx: `{tx.get('tx')}`", parse_mode="Markdown")
     else:
-        _, e, _, _ = get_db(uid)
         e['total_earned'] += DAILY_BONUS_AMOUNT; e['unclaimed'] += DAILY_BONUS_AMOUNT
-        _save_json(EARNINGS_DB_FILE, earnings_db)
         await update.message.reply_text(f"Bonus added! ({tx.get('message', '')})")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("*How to Play*\nArrows: Move | Space: Jump\n\n*Claims*\n- No minimum required!\n"
+        f"- Daily: {DAILY_BONUS_AMOUNT} FREE INFINITE/24h\n\n/play /wallet /claim /daily /balance")
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -459,18 +456,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== FLASK ROUTES ==========
 @app.route("/")
 def index():
-    return jsonify({
-        "bot": "Infinitecoin Jumper",
-        "escrow": "LIVE" if escrow_ready else "DEMO",
-        "users": len(user_db),
-        "treasury_balance": get_treasury_balance(),
-        "token_price_usd": get_token_price(),
-        "normal_cap": NORMAL_CAP,
-        "whale_threshold": WHALE_THRESHOLD,
-        "whale_percent": WHALE_PERCENT,
-        "whale_max": WHALE_MAX,
-        "cooldown_hours": COOLDOWN_HOURS
-    })
+    return jsonify({"bot": "Infinitecoin Jumper", "escrow": "LIVE" if escrow_ready else "DEMO", "users": len(user_db)})
 
 @app.route("/health")
 def health():
@@ -491,40 +477,14 @@ def webhook():
 @app.route("/wallet-callback")
 def wallet_callback():
     uid = request.args.get("user_id", "")
-    wallet = request.args.get("phantom_wallet") or request.args.get("wallet") or ""
+    wallet = request.args.get("phantom_wallet") or request.args.get("wallet") or request.args.get("address") or ""
     if wallet and uid:
+        can_set, _ = _can_set_wallet(uid, wallet)
+        if not can_set:
+            return '<h1>Wallet Already Linked</h1><p>This wallet is connected to another account.</p>'
         user_db.setdefault(uid, {})["wallet"] = wallet
-        _save_json(USER_DB_FILE, user_db)
         return redirect(f"{GAME_URL}?user_id={uid}&wallet={wallet}")
     return '<h1>Connect Wallet</h1><form>...</form>'
-
-# ========== GAME API ==========
-@app.route("/api/status", methods=["GET"])
-def api_status():
-    uid = request.args.get("user_id", "")
-    resp = {
-        "normal_cap": NORMAL_CAP,
-        "whale_threshold": WHALE_THRESHOLD,
-        "whale_percent": WHALE_PERCENT,
-        "whale_max": WHALE_MAX,
-        "cooldown_hours": COOLDOWN_HOURS,
-        "treasury_balance": get_treasury_balance(),
-        "token_price_usd": get_token_price()
-    }
-    if uid:
-        _, e, _, _ = get_db(uid)
-        last_claim = e.get("last_claim_time", 0)
-        hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
-        claimable = calculate_claimable(e['unclaimed'], e.get("used_whale_bonus", False))
-        resp.update({
-            "unclaimed": e['unclaimed'],
-            "used_whale_bonus": e.get("used_whale_bonus", False),
-            "can_claim": hours_since >= COOLDOWN_HOURS and e['unclaimed'] > 0,
-            "cooldown_remaining": max(0, COOLDOWN_HOURS - hours_since),
-            "claimable_now": claimable,
-            "is_whale": e['unclaimed'] >= WHALE_THRESHOLD and not e.get("used_whale_bonus", False)
-        })
-    return jsonify(resp)
 
 @app.route("/api/wallet", methods=["POST"])
 def api_wallet():
@@ -533,8 +493,10 @@ def api_wallet():
     uid = str(data.get("telegram_user_id", ""))
     if not wallet or not uid or len(wallet) < 32:
         return jsonify({"error": "Invalid"}), 400
+    can_set, _ = _can_set_wallet(uid, wallet)
+    if not can_set:
+        return jsonify({"error": "Wallet already linked"}), 409
     user_db.setdefault(uid, {})["wallet"] = wallet
-    _save_json(USER_DB_FILE, user_db)
     return jsonify({"success": True})
 
 @app.route("/api/earnings", methods=["POST"])
@@ -542,12 +504,9 @@ def api_earnings():
     data = request.get_json() or {}
     uid = str(data.get("telegram_user_id", ""))
     amount = int(data.get("amount", 0))
-    if not uid or amount <= 0:
-        return jsonify({"error": "Invalid"}), 400
+    if not uid: return jsonify({"error": "Missing user_id"}), 400
     _, e, _, _ = get_db(uid)
-    e["total_earned"] += amount
-    e["unclaimed"] += amount
-    _save_json(EARNINGS_DB_FILE, earnings_db)
+    e["total_earned"] += amount; e["unclaimed"] += amount
     return jsonify({"success": True, "unclaimed": e["unclaimed"]})
 
 @app.route("/api/claim", methods=["POST"])
@@ -556,24 +515,22 @@ def api_claim():
     uid = str(data.get("telegram_user_id", ""))
     wallet = data.get("wallet_address", "").strip()
 
-    if not uid or not wallet:
-        return jsonify({"error": "Invalid"}), 400
+    if not uid or not wallet: return jsonify({"error": "Invalid"}), 400
 
     _, e, _, _ = get_db(uid)
 
     if e['unclaimed'] <= 0:
         return jsonify({"success": False, "message": "No IFC to claim"})
 
-    # Cooldown check
+    # Check 24h cooldown
     last_claim = e.get("last_claim_time", 0)
     hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
-    if hours_since < COOLDOWN_HOURS:
-        remaining = COOLDOWN_HOURS - hours_since
-        return jsonify({"success": False, "message": f"Cooldown: {remaining:.1f}h", "cooldown": True})
+    if hours_since < CLAIM_COOLDOWN:
+        remaining = CLAIM_COOLDOWN - hours_since
+        return jsonify({"success": False, "message": "Cooldown: %.1fh remaining" % remaining, "cooldown": True})
 
-    # Calculate claimable
+    # Calculate claimable amount
     claimable = calculate_claimable(e['unclaimed'], e.get("used_whale_bonus", False))
-
     if claimable <= 0:
         return jsonify({"success": False, "message": "Nothing to claim"})
 
@@ -584,19 +541,17 @@ def api_claim():
         e['unclaimed'] -= claimable
         e["last_claim_time"] = int(time.time() * 1000)
 
-        was_whale = claimable > NORMAL_CAP
-        if was_whale:
+        # Mark whale bonus used if this was a whale claim
+        if claimable > NORMAL_CAP:
             e["used_whale_bonus"] = True
 
         _save_json(EARNINGS_DB_FILE, earnings_db)
 
-        return jsonify({
-            "success": True,
-            "tx": result.get("tx"),
-            "amount": claimable,
-            "was_whale": was_whale,
-            "message": f"Sent {claimable:,} INFINITE" + (" (Whale bonus!)" if was_whale else "")
-        })
+        msg = "Sent %s INFINITE" % claimable
+        if claimable > NORMAL_CAP:
+            msg += " (Whale bonus!)"
+
+        return jsonify({"success": True, "tx": result.get("tx"), "amount": claimable, "message": msg})
 
     return jsonify({"success": False, "message": result.get("message", "Transfer failed")})
 
@@ -608,61 +563,88 @@ def api_daily():
     if not uid: return jsonify({"error": "Missing"}), 400
     if not is_daily_available(uid): return jsonify({"success": False, "message": "Cooldown"})
     daily_bonus_db[uid] = int(time.time() * 1000)
-    _save_json(DAILY_DB_FILE, daily_bonus_db)
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
-    if result.get('success'):
-        _, e, _, _ = get_db(uid)
-        e['total_earned'] += DAILY_BONUS_AMOUNT; e['total_claimed'] += DAILY_BONUS_AMOUNT
-        _save_json(EARNINGS_DB_FILE, earnings_db)
     return jsonify({"success": True, "tx": result.get("tx", ""), "transferred": result.get("success", False)})
 
 @app.route("/api/balance/<uid>", methods=["GET"])
-def api_balance(uid):
+def api_get_balance(uid):
+    wallet = user_db.get(str(uid), {}).get("wallet", "")
     _, e, _, _ = get_db(uid)
-    claimable = calculate_claimable(e['unclaimed'], e.get("used_whale_bonus", False))
-    return jsonify({
-        "earned": e['total_earned'],
-        "unclaimed": e['unclaimed'],
-        "claimed": e['total_claimed'],
-        "claimable_now": claimable,
-        "used_whale_bonus": e.get("used_whale_bonus", False),
-        "is_whale": e['unclaimed'] >= WHALE_THRESHOLD and not e.get("used_whale_bonus", False)
-    })
+    result = {"earned": e['total_earned'], "unclaimed": e['unclaimed'], "claimed": e['total_claimed']}
+    if wallet:
+        bal = has_minimum_balance(wallet)
+        result.update({"wallet_balance": bal['balance'], "can_claim": True})
+    return jsonify(result)
 
-# ========== LEADERBOARD ==========
+# ========== LEADERBOARD ROUTES ==========
 @app.route("/api/score", methods=["POST"])
 def api_score():
+    """Save player's best distance. Wallet address is the unique ID."""
     data = request.get_json() or {}
     wallet = data.get("wallet_address", "").strip()
     distance = int(data.get("distance", 0))
     username = data.get("username", "Anonymous")
+    
     if not wallet or len(wallet) < 32 or distance < 0:
         return jsonify({"error": "Invalid"}), 400
+    
     existing = high_scores_db.get(wallet, {"best_distance": 0})
     if distance > existing.get("best_distance", 0):
-        high_scores_db[wallet] = {"best_distance": distance, "username": username, "last_updated": time.time()}
-        _save_json(HIGH_SCORES_FILE, high_scores_db)
+        high_scores_db[wallet] = {
+            "best_distance": distance,
+            "username": username,
+            "last_updated": time.time()
+        }
         return jsonify({"success": True, "new_record": True, "best_distance": distance})
     return jsonify({"success": True, "new_record": False, "best_distance": existing.get("best_distance", 0)})
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    sorted_scores = sorted(high_scores_db.items(), key=lambda x: x[1].get("best_distance", 0), reverse=True)[:10]
+    """Return top 10 players by distance."""
+    sorted_scores = sorted(
+        high_scores_db.items(),
+        key=lambda x: x[1].get("best_distance", 0),
+        reverse=True
+    )[:10]
+    
     leaderboard = []
     for rank, (wallet, data) in enumerate(sorted_scores, 1):
-        leaderboard.append({"rank": rank, "wallet": wallet[:4] + "..." + wallet[-4:], "full_wallet": wallet, "username": data.get("username", "Anonymous"), "distance": data.get("best_distance", 0)})
+        leaderboard.append({
+            "rank": rank,
+            "wallet": wallet[:4] + "..." + wallet[-4:],
+            "full_wallet": wallet,
+            "username": data.get("username", "Anonymous"),
+            "distance": data.get("best_distance", 0)
+        })
     return jsonify({"leaderboard": leaderboard, "total_players": len(high_scores_db)})
 
 @app.route("/api/highscore/<wallet>", methods=["GET"])
 def api_highscore(wallet):
+    """Get personal best for a wallet."""
     w = wallet.strip()
-    if not w or len(w) < 32: return jsonify({"error": "Invalid"}), 400
+    if not w or len(w) < 32:
+        return jsonify({"error": "Invalid wallet"}), 400
     data = high_scores_db.get(w, {"best_distance": 0, "username": "Anonymous"})
-    return jsonify({"best_distance": data.get("best_distance", 0), "username": data.get("username", "Anonymous")})
+    return jsonify({
+        "best_distance": data.get("best_distance", 0),
+        "username": data.get("username", "Anonymous")
+    })
+
+@app.route("/setup-webhook")
+def setup_webhook():
+    try:
+        f1 = asyncio.run_coroutine_threadsafe(telegram_app.bot.delete_webhook(drop_pending_updates=True), _bot_loop)
+        f1.result(timeout=10)
+        f2 = asyncio.run_coroutine_threadsafe(telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook"), _bot_loop)
+        f2.result(timeout=10)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ========== INIT ==========
 telegram_app = None
 _bot_loop = None
+_bot_thread = None
 
 async def _bot_main():
     global telegram_app
@@ -674,6 +656,7 @@ async def _bot_main():
     telegram_app.add_handler(CommandHandler("balance", cmd_balance))
     telegram_app.add_handler(CommandHandler("claim", cmd_claim))
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
+    telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
     await telegram_app.initialize()
     await telegram_app.start()
@@ -681,12 +664,13 @@ async def _bot_main():
     while True: await asyncio.sleep(3600)
 
 def init_bot():
-    global _bot_loop
+    global _bot_loop, _bot_thread
     _bot_loop = asyncio.new_event_loop()
-    def _run():
+    def _run_loop():
         asyncio.set_event_loop(_bot_loop)
         _bot_loop.run_until_complete(_bot_main())
-    threading.Thread(target=_run, daemon=True).start()
+    _bot_thread = threading.Thread(target=_run_loop, daemon=True)
+    _bot_thread.start()
     time.sleep(0.5)
 
 if not BOT_TOKEN:
