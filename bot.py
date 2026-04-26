@@ -149,7 +149,7 @@ def get_required_infinite_for_holder():
 
 def is_holder(wallet_address):
     global _holder_cache
-    if not escrow_ready or not wallet_address:
+    if not wallet_address:
         return False
     now = time.time()
     cached = _holder_cache.get(wallet_address)
@@ -324,26 +324,59 @@ def get_db(user_id):
 
 # ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
-    if not escrow_ready or not get_associated_token_address:
-        return 0
+    """Get INFINITE token balance via HTTP RPC with fallback."""
+    # Try HTTP RPC first (works from Railway, no CORS issues)
     try:
         from solders.pubkey import Pubkey
         recipient_pk = Pubkey.from_string(wallet_address)
-        recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
-        if not isinstance(recipient_ata, Pubkey):
-            recipient_ata = Pubkey.from_string(str(recipient_ata))
-        resp = solana_client.get_token_account_balance(recipient_ata)
-        if hasattr(resp, 'value') and resp.value:
-            return float(resp.value.ui_amount or 0)
-        return 0
+
+        # Build ATA address manually
+        seeds = [bytes(recipient_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
+        recipient_ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+
+        # HTTP RPC call
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountBalance",
+            "params": [str(recipient_ata)]
+        }
+        resp = requests.post(SOLANA_RPC, json=payload, timeout=15, headers={"Content-Type": "application/json"})
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'result' in data and 'value' in data['result']:
+                val = data['result']['value']
+                ui_amount = val.get('uiAmount') or val.get('uiAmountString', '0')
+                bal = float(ui_amount) if ui_amount else 0
+                logger.info("HTTP RPC balance for %s...: %.2f INFINITE", wallet_address[:6], bal)
+                return bal
     except Exception as e:
-        logger.error("Balance check error: %s", e)
-        return 0
+        logger.warning("HTTP RPC balance failed: %s", e)
+
+    # Fallback: try solana_client if available
+    if escrow_ready and get_associated_token_address:
+        try:
+            from solders.pubkey import Pubkey
+            recipient_pk = Pubkey.from_string(wallet_address)
+            recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
+            if not isinstance(recipient_ata, Pubkey):
+                recipient_ata = Pubkey.from_string(str(recipient_ata))
+            resp = solana_client.get_token_account_balance(recipient_ata)
+            if hasattr(resp, 'value') and resp.value:
+                return float(resp.value.ui_amount or 0)
+        except Exception as e:
+            logger.error("Client balance fallback failed: %s", e)
+
+    return 0
 
 def has_minimum_balance(wallet_address):
     balance = get_wallet_balance(wallet_address)
     usd_value = balance * get_token_price()
-    return {"has_min": True, "balance": balance, "usd_value": usd_value}
+    required = get_required_infinite_for_holder()
+    has_min = False
+    if required and balance >= required:
+        has_min = True
+    return {"has_min": has_min, "balance": balance, "usd_value": usd_value, "required": required}
 
 # ========== REAL TOKEN TRANSFER ==========
 def transfer_ifc(recipient, amount):
