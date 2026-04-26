@@ -671,6 +671,7 @@ def api_get_user(uid):
         "daily_cap": cap,
         "daily_claimed": claimed,
         "daily_remaining": remaining,
+        "daily_reset_ms": get_daily_reset_time(uid),
         "is_holder": is_holder(wallet) if wallet else False
     }
     logger.info("API /api/user/%s: wallet=%s...", uid, wallet[:6] if wallet else "none")
@@ -833,21 +834,22 @@ def api_get_balance(uid):
     cap = get_daily_cap(wallet)
     claimed, _, _ = get_daily_claimed(uid)
     remaining = max(0, cap - claimed)
+    holder = is_holder(wallet) if wallet else False
     result = {
         "earned": e['total_earned'],
         "unclaimed": e['unclaimed'],
         "claimed": e['total_claimed'],
         "daily_cap": cap,
         "daily_claimed": claimed,
-        "daily_remaining": remaining
+        "daily_remaining": remaining,
+        "daily_reset_ms": get_daily_reset_time(uid),
+        "is_holder": holder
     }
     if wallet:
         bal = has_minimum_balance(wallet)
-        holder = is_holder(wallet)
         result.update({
             "wallet_balance": bal['balance'],
             "can_claim": True,
-            "is_holder": holder,
         })
     logger.info("API /api/balance/%s: unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
     return jsonify(result)
