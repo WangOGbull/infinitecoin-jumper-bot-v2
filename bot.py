@@ -654,6 +654,28 @@ def api_status():
         "mint_address": IFC_MINT
     })
 
+@app.route("/api/user/<uid>", methods=["GET"])
+def api_get_user(uid):
+    """Return wallet and daily stats for a user by Telegram ID."""
+    wallet = user_db.get(str(uid), {}).get("wallet", "")
+    _, e, _, _ = get_db(uid)
+    cap = get_daily_cap(wallet)
+    claimed, _, _ = get_daily_claimed(uid)
+    remaining = max(0, cap - claimed)
+    result = {
+        "telegram_user_id": uid,
+        "wallet_address": wallet,
+        "earned": e['total_earned'],
+        "unclaimed": e['unclaimed'],
+        "claimed": e['total_claimed'],
+        "daily_cap": cap,
+        "daily_claimed": claimed,
+        "daily_remaining": remaining,
+        "is_holder": is_holder(wallet) if wallet else False
+    }
+    logger.info("API /api/user/%s: wallet=%s...", uid, wallet[:6] if wallet else "none")
+    return jsonify(result)
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
