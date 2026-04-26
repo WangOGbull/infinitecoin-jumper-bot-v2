@@ -324,34 +324,54 @@ def get_db(user_id):
 
 # ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
-    """Get INFINITE token balance via HTTP RPC with fallback."""
-    # Try HTTP RPC first (works from Railway, no CORS issues)
-    try:
-        from solders.pubkey import Pubkey
-        recipient_pk = Pubkey.from_string(wallet_address)
+    """Get INFINITE token balance via HTTP RPC with multiple endpoint fallback."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            wallet_address,
+            {"mint": IFC_MINT},
+            {"encoding": "jsonParsed"}
+        ]
+    }
 
-        # Build ATA address manually
-        seeds = [bytes(recipient_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
-        recipient_ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+    # Try multiple public RPC endpoints (Railway IPs often get rate-limited)
+    endpoints = [
+        SOLANA_RPC,  # Primary
+        "https://solana-rpc.publicnode.com",
+        "https://rpc.ankr.com/solana",
+        "https://solana-mainnet.rpc.extrnode.com",
+    ]
 
-        # HTTP RPC call
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountBalance",
-            "params": [str(recipient_ata)]
-        }
-        resp = requests.post(SOLANA_RPC, json=payload, timeout=15, headers={"Content-Type": "application/json"})
-        if resp.status_code == 200:
-            data = resp.json()
-            if 'result' in data and 'value' in data['result']:
-                val = data['result']['value']
-                ui_amount = val.get('uiAmount') or val.get('uiAmountString', '0')
-                bal = float(ui_amount) if ui_amount else 0
-                logger.info("HTTP RPC balance for %s...: %.2f INFINITE", wallet_address[:6], bal)
-                return bal
-    except Exception as e:
-        logger.warning("HTTP RPC balance failed: %s", e)
+    for url in endpoints:
+        try:
+            resp = requests.post(url, json=payload, timeout=10, headers={"Content-Type": "application/json"})
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'result' in data and 'value' in data['result']:
+                    accounts = data['result']['value']
+                    if accounts and len(accounts) > 0:
+                        total = 0
+                        for acc in accounts:
+                            try:
+                                info = acc['account']['data']['parsed']['info']
+                                ui_amount = info['tokenAmount']['uiAmount']
+                                if ui_amount is not None:
+                                    total += float(ui_amount)
+                            except Exception:
+                                pass
+                        logger.info("Balance OK from %s for %s...: %.2f INFINITE", url.split('/')[2], wallet_address[:6], total)
+                        return total
+                    else:
+                        logger.info("No accounts from %s for %s...", url.split('/')[2], wallet_address[:6])
+                        return 0
+                elif 'error' in data:
+                    logger.warning("RPC error from %s: %s", url, data['error'])
+            else:
+                logger.warning("HTTP %s from %s", resp.status_code, url)
+        except Exception as e:
+            logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:60])
 
     # Fallback: try solana_client if available
     if escrow_ready and get_associated_token_address:
@@ -365,8 +385,9 @@ def get_wallet_balance(wallet_address):
             if hasattr(resp, 'value') and resp.value:
                 return float(resp.value.ui_amount or 0)
         except Exception as e:
-            logger.error("Client balance fallback failed: %s", e)
+            logger.error("Client fallback failed: %s", e)
 
+    logger.error("All RPC endpoints failed for balance check")
     return 0
 
 def has_minimum_balance(wallet_address):
