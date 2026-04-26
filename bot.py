@@ -1,6 +1,6 @@
 """
 Infinitecoin Jumper Bot - Holder Model v3
-Free: 10K/day | Holders (0.1 SOL worth INFINITE): 15K/day
+Free: 10K/day | Holders (0.1 SOL worth INFINITE): 500K/day
 Wallet locked 1x forever. Daily bonus spam-protected by wallet + UID.
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct
@@ -68,12 +68,12 @@ def get_sol_price():
     except Exception as e:
         logger.error("SOL price fetch failed: %s", e)
     if SOL_PRICE_USD is None:
-        SOL_PRICE_USD = 150.0
+        SOL_PRICE_USD = 86.24
     return SOL_PRICE_USD
 
 # ========== CLAIM CAPS ==========
 FREE_CAP = 10000
-HOLDER_CAP = 15000
+HOLDER_CAP = 500000
 DAILY_BONUS_AMOUNT = 500
 CLAIM_COOLDOWN = 24
 
@@ -472,7 +472,7 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = get_db(uid)[0].get("wallet")
     if existing:
         holder = is_holder(existing)
-        tier = "\U0001F48E HOLDER (15K/day)" if holder else "\U0001F464 Free (10K/day)"
+        tier = "\U0001F48E HOLDER (500K/day)" if holder else "\U0001F464 Free (10K/day)"
         await update.message.reply_text(
             f"Wallet locked: `{existing[:4]}...{existing[-4:]}`\n{tier}\nUse /balance or /claim.", parse_mode="Markdown")
         return
@@ -510,11 +510,11 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req = get_required_infinite_for_holder()
         lines.append(f"Balance: {bal['balance']:,.2f} INFINITE (${bal['usd_value']:.6f})")
         if holder:
-            lines.append("Tier: \U0001F48E *HOLDER* — 15K/day claim cap")
+            lines.append("Tier: \U0001F48E *HOLDER* — 500K/day claim cap")
         else:
             lines.append(f"Tier: \U0001F464 *Free* — 10K/day claim cap")
             if req:
-                lines.append(f"Hold {req:,.0f} INFINITE to unlock 15K/day")
+                lines.append(f"Hold {req:,.0f} INFINITE to unlock 500K/day")
         lines.append("Status: *Ready to claim*")
     else:
         lines.append("Wallet: *Not connected*")
@@ -581,11 +581,11 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = get_required_infinite_for_holder()
-    req_text = f"Hold {req:,.0f} INFINITE to unlock 15K/day" if req else ""
+    req_text = f"Hold {req:,.0f} INFINITE to unlock 500K/day" if req else ""
     await update.message.reply_text(
         f"*How to Play*\nArrows: Move | Space: Jump\n\n*Claims*\n"
         f"\U0001F464 Free: 10K/day max\n"
-        f"\U0001F48E Holders: 15K/day max\n"
+        f"\U0001F48E Holders: 500K/day max\n"
         f"{req_text}\n"
         f"- Daily: {DAILY_BONUS_AMOUNT} FREE INFINITE/24h\n\n"
         f"/play /wallet /claim /daily /balance",
