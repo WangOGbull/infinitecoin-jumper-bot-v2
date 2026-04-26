@@ -324,26 +324,41 @@ def get_db(user_id):
 
 # ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
-    """Get INFINITE token balance via HTTP RPC with multiple endpoint fallback."""
+    """Get INFINITE token balance via Solscan API (reliable REST API)."""
+    # Primary: Solscan public API (REST, no RPC issues)
+    try:
+        url = f"https://public-api.solscan.io/account/tokens?address={wallet_address}"
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        logger.info("Solscan API status: %s for %s", resp.status_code, wallet_address[:6])
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info("Solscan response: %s", json.dumps(data)[:300])
+            # Find INFINITE token in the list
+            for token in data:
+                token_address = token.get("tokenAddress", "")
+                if token_address == IFC_MINT:
+                    bal = float(token.get("tokenAmount", {}).get("uiAmount", 0))
+                    logger.info("Solscan balance for %s...: %.2f INFINITE", wallet_address[:6], bal)
+                    return bal
+            logger.info("INFINITE token not found in wallet %s...", wallet_address[:6])
+            return 0
+        else:
+            logger.warning("Solscan HTTP %s: %s", resp.status_code, resp.text[:100])
+    except Exception as e:
+        logger.warning("Solscan API failed: %s", str(e)[:80])
+
+    # Fallback 1: HTTP RPC to Solana
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getTokenAccountsByOwner",
-        "params": [
-            wallet_address,
-            {"mint": IFC_MINT},
-            {"encoding": "jsonParsed"}
-        ]
+        "params": [wallet_address, {"mint": IFC_MINT}, {"encoding": "jsonParsed"}]
     }
-
-    # Try multiple public RPC endpoints (Railway IPs often get rate-limited)
-    endpoints = [
-        SOLANA_RPC,  # Primary
-        "https://solana-rpc.publicnode.com",
-        "https://rpc.ankr.com/solana",
-        "https://solana-mainnet.rpc.extrnode.com",
-    ]
-
+    endpoints = [SOLANA_RPC, "https://solana-rpc.publicnode.com", "https://rpc.ankr.com/solana"]
     for url in endpoints:
         try:
             resp = requests.post(url, json=payload, timeout=10, headers={"Content-Type": "application/json"})
@@ -351,7 +366,7 @@ def get_wallet_balance(wallet_address):
                 data = resp.json()
                 if 'result' in data and 'value' in data['result']:
                     accounts = data['result']['value']
-                    if accounts and len(accounts) > 0:
+                    if accounts:
                         total = 0
                         for acc in accounts:
                             try:
@@ -361,19 +376,13 @@ def get_wallet_balance(wallet_address):
                                     total += float(ui_amount)
                             except Exception:
                                 pass
-                        logger.info("Balance OK from %s for %s...: %.2f INFINITE", url.split('/')[2], wallet_address[:6], total)
+                        logger.info("RPC balance for %s...: %.2f INFINITE", wallet_address[:6], total)
                         return total
-                    else:
-                        logger.info("No accounts from %s for %s...", url.split('/')[2], wallet_address[:6])
-                        return 0
-                elif 'error' in data:
-                    logger.warning("RPC error from %s: %s", url, data['error'])
-            else:
-                logger.warning("HTTP %s from %s", resp.status_code, url)
+                    return 0
         except Exception as e:
             logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:60])
 
-    # Fallback: try solana_client if available
+    # Fallback 2: solana_client library
     if escrow_ready and get_associated_token_address:
         try:
             from solders.pubkey import Pubkey
@@ -387,7 +396,7 @@ def get_wallet_balance(wallet_address):
         except Exception as e:
             logger.error("Client fallback failed: %s", e)
 
-    logger.error("All RPC endpoints failed for balance check")
+    logger.error("All balance methods failed")
     return 0
 
 def has_minimum_balance(wallet_address):
