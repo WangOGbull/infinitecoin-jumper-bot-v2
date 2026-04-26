@@ -1,5 +1,5 @@
 """
-Infinitecoin Jumper Bot - Production Ready
+Infinitecoin Jumper Bot - Production Ready (Rebuilt)
 No minimum balance required for claims. Real INFINITE token transfers from treasury.
 Leaderboard + High Score support added.
 """
@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BASE_URL = os.environ.get("BASE_URL", "https://web-production-3acec.up.railway.app").rstrip("/")
-GAME_URL = os.environ.get("GAME_URL", "https://effortless-empanada-7db313.netlify.app").rstrip("/")
+BASE_URL = os.environ.get("BASE_URL", "https://your-app.up.railway.app").rstrip("/")
+GAME_URL = os.environ.get("GAME_URL", "https://your-game.vercel.app").rstrip("/")
 IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjmpnj1fhzpump")
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -62,12 +62,40 @@ CLAIM_COOLDOWN = 24
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
 
-user_db = {}
-earnings_db = {}
-escrow_db = {}
-daily_bonus_db = {}
+# ========== DATABASE PERSISTENCE ==========
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+USER_DB_FILE = os.path.join(DATA_DIR, "users.json")
+EARNINGS_DB_FILE = os.path.join(DATA_DIR, "earnings.json")
+ESCROW_DB_FILE = os.path.join(DATA_DIR, "escrow.json")
+DAILY_DB_FILE = os.path.join(DATA_DIR, "daily.json")
+HIGHSCORE_DB_FILE = os.path.join(DATA_DIR, "highscores.json")
+
+def _load_json(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error("Load %s error: %s", path, e)
+    return default
+
+def _save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error("Save %s error: %s", path, e)
+
+user_db = _load_json(USER_DB_FILE, {})
+earnings_db = _load_json(EARNINGS_DB_FILE, {})
+escrow_db = _load_json(ESCROW_DB_FILE, {})
+daily_bonus_db = _load_json(DAILY_DB_FILE, {})
+high_scores_db = _load_json(HIGHSCORE_DB_FILE, {})
+
 # ========== LEADERBOARD DATABASE ==========
-high_scores_db = {}  # {wallet_address: {"best_distance": int, "username": str, "last_updated": timestamp}}
+# high_scores_db: {wallet_address: {"best_distance": int, "username": str, "last_updated": timestamp}}
 
 # ========== WALLET UNIQUENESS ==========
 def _get_uid_by_wallet(wallet_address):
@@ -128,7 +156,7 @@ def _setup_solana():
             mint_owner = str(mint_info.value.owner)
         else:
             mint_owner = mint_info.get('result', {}).get('value', {}).get('owner')
-        
+
         if mint_owner == str(TOKEN_2022_PROGRAM):
             TOKEN_PROGRAM_ID = TOKEN_2022_PROGRAM
             logger.info("Detected Token-2022 program for mint")
@@ -399,6 +427,7 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_set:
         await update.message.reply_text("Wallet already linked to another account!"); return
     user_db.setdefault(uid, {})["wallet"] = wallet
+    _save_json(USER_DB_FILE, user_db)
     await update.message.reply_text(f"Wallet saved! Now /claim or /balance.", parse_mode="Markdown")
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,6 +457,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = transfer_ifc(wallet, e['unclaimed'])
     if result['success']:
         e['total_claimed'] += e['unclaimed']; e['unclaimed'] = 0
+        _save_json(EARNINGS_DB_FILE, earnings_db)
     await update.message.reply_text(f"{'Claimed' if result['success'] else 'Failed'}: {result['message']}\nTx: `{result.get('tx', 'N/A')}`", parse_mode="Markdown")
 
 async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -437,12 +467,15 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_daily_available(uid):
         await update.message.reply_text(f"Cooldown. Next: {get_daily_remaining_text(uid)}"); return
     daily_bonus_db[uid] = int(time.time() * 1000)
+    _save_json(DAILY_DB_FILE, daily_bonus_db)
     tx = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
     if tx.get('success'):
         e['total_earned'] += DAILY_BONUS_AMOUNT; e['total_claimed'] += DAILY_BONUS_AMOUNT
+        _save_json(EARNINGS_DB_FILE, earnings_db)
         await update.message.reply_text(f"DAILY BONUS! +{DAILY_BONUS_AMOUNT:,} INFINITE!\nTx: `{tx.get('tx')}`", parse_mode="Markdown")
     else:
         e['total_earned'] += DAILY_BONUS_AMOUNT; e['unclaimed'] += DAILY_BONUS_AMOUNT
+        _save_json(EARNINGS_DB_FILE, earnings_db)
         await update.message.reply_text(f"Bonus added! ({tx.get('message', '')})")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,6 +498,8 @@ def health():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
+        if telegram_app is None:
+            return jsonify({"ok": False, "error": "Bot not ready"}), 503
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
         future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), _bot_loop)
@@ -483,8 +518,9 @@ def wallet_callback():
         if not can_set:
             return '<h1>Wallet Already Linked</h1><p>This wallet is connected to another account.</p>'
         user_db.setdefault(uid, {})["wallet"] = wallet
+        _save_json(USER_DB_FILE, user_db)
         return redirect(f"{GAME_URL}?user_id={uid}&wallet={wallet}")
-    return '<h1>Connect Wallet</h1><form>...</form>'
+    return '<h1>Connect Wallet</h1><p>Wallet connection failed. Use /setwallet in the bot instead.</p>'
 
 @app.route("/api/wallet", methods=["POST"])
 def api_wallet():
@@ -497,6 +533,7 @@ def api_wallet():
     if not can_set:
         return jsonify({"error": "Wallet already linked"}), 409
     user_db.setdefault(uid, {})["wallet"] = wallet
+    _save_json(USER_DB_FILE, user_db)
     return jsonify({"success": True})
 
 @app.route("/api/earnings", methods=["POST"])
@@ -507,6 +544,7 @@ def api_earnings():
     if not uid: return jsonify({"error": "Missing user_id"}), 400
     _, e, _, _ = get_db(uid)
     e["total_earned"] += amount; e["unclaimed"] += amount
+    _save_json(EARNINGS_DB_FILE, earnings_db)
     return jsonify({"success": True, "unclaimed": e["unclaimed"]})
 
 @app.route("/api/claim", methods=["POST"])
@@ -563,6 +601,7 @@ def api_daily():
     if not uid: return jsonify({"error": "Missing"}), 400
     if not is_daily_available(uid): return jsonify({"success": False, "message": "Cooldown"})
     daily_bonus_db[uid] = int(time.time() * 1000)
+    _save_json(DAILY_DB_FILE, daily_bonus_db)
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
     return jsonify({"success": True, "tx": result.get("tx", ""), "transferred": result.get("success", False)})
 
@@ -584,10 +623,10 @@ def api_score():
     wallet = data.get("wallet_address", "").strip()
     distance = int(data.get("distance", 0))
     username = data.get("username", "Anonymous")
-    
+
     if not wallet or len(wallet) < 32 or distance < 0:
         return jsonify({"error": "Invalid"}), 400
-    
+
     existing = high_scores_db.get(wallet, {"best_distance": 0})
     if distance > existing.get("best_distance", 0):
         high_scores_db[wallet] = {
@@ -595,6 +634,7 @@ def api_score():
             "username": username,
             "last_updated": time.time()
         }
+        _save_json(HIGHSCORE_DB_FILE, high_scores_db)
         return jsonify({"success": True, "new_record": True, "best_distance": distance})
     return jsonify({"success": True, "new_record": False, "best_distance": existing.get("best_distance", 0)})
 
@@ -606,7 +646,7 @@ def api_leaderboard():
         key=lambda x: x[1].get("best_distance", 0),
         reverse=True
     )[:10]
-    
+
     leaderboard = []
     for rank, (wallet, data) in enumerate(sorted_scores, 1):
         leaderboard.append({
@@ -661,6 +701,16 @@ async def _bot_main():
     await telegram_app.initialize()
     await telegram_app.start()
     logger.info("Bot started")
+
+    # Auto-setup webhook after start
+    await asyncio.sleep(2)
+    try:
+        await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+        await telegram_app.bot.set_webhook(url=f"{BASE_URL}/webhook")
+        logger.info("Webhook auto-set to %s/webhook", BASE_URL)
+    except Exception as e:
+        logger.error("Auto webhook setup failed: %s", e)
+
     while True: await asyncio.sleep(3600)
 
 def init_bot():
