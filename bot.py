@@ -1,7 +1,7 @@
 """
-Infinitecoin Jumper Bot - Holder Model v3
+Infinitecoin Jumper Bot - Holder Model v4
 Free: 10K/day | Holders (0.1 SOL worth INFINITE): 500K/day
-Wallet locked 1x forever. Daily bonus spam-protected by wallet + UID.
+Wallet locked 1x forever. Heavy API logging for debug.
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct
 from datetime import datetime, timezone
@@ -42,12 +42,13 @@ def get_token_price():
             if price > 0:
                 IFC_PRICE_USD = price
                 _last_price_fetch = now
-                logger.info("DexScreener IFC price: $%.8f", IFC_PRICE_USD)
+                logger.info("DexScreener IFC price: $%.10f", IFC_PRICE_USD)
                 return IFC_PRICE_USD
     except Exception as e:
-        logger.error("DexScreener failed: %s", e)
+        logger.error("DexScreener IFC failed: %s", e)
     if IFC_PRICE_USD is None:
         IFC_PRICE_USD = 0.00000329
+        logger.info("Using IFC fallback price: $%.10f", IFC_PRICE_USD)
     return IFC_PRICE_USD
 
 def get_sol_price():
@@ -69,6 +70,7 @@ def get_sol_price():
         logger.error("SOL price fetch failed: %s", e)
     if SOL_PRICE_USD is None:
         SOL_PRICE_USD = 86.24
+        logger.info("Using SOL fallback price: $%.2f", SOL_PRICE_USD)
     return SOL_PRICE_USD
 
 # ========== CLAIM CAPS ==========
@@ -114,6 +116,8 @@ daily_bonus_db = _load_json(DAILY_DB_FILE, {})
 wallet_daily_db = _load_json(WALLET_DAILY_DB_FILE, {})
 high_scores_db = _load_json(HIGHSCORE_DB_FILE, {})
 
+logger.info("Loaded DBs: users=%s earnings=%s scores=%s", len(user_db), len(earnings_db), len(high_scores_db))
+
 # ========== WALLET UNIQUENESS ==========
 def _get_uid_by_wallet(wallet_address):
     w = wallet_address.strip()
@@ -139,6 +143,7 @@ def get_required_infinite_for_holder():
         return None
     usd_needed = 0.1 * sol_price
     tokens_needed = usd_needed / infinite_price
+    logger.info("Holder req: $%.2f / $%.10f = %.0f INFINITE", usd_needed, infinite_price, tokens_needed)
     return tokens_needed
 
 def is_holder(wallet_address):
@@ -156,7 +161,7 @@ def is_holder(wallet_address):
             return False
         result = balance >= required
         _holder_cache[wallet_address] = (result, now)
-        logger.info("Holder check %s: %.2f / %.2f INFINITE -> %s", wallet_address[:4], balance, required, result)
+        logger.info("Holder check %s...: %.2f / %.0f INFINITE -> %s", wallet_address[:4], balance, required, result)
         return result
     except Exception as e:
         logger.error("Holder check error: %s", e)
@@ -267,7 +272,7 @@ def calculate_claimable(unclaimed, wallet_address):
 def get_db(user_id):
     uid = str(user_id)
     user_db.setdefault(uid, {})
-    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0})
+    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0, "last_claim_time": 0})
     escrow_db.setdefault(uid, {"hold_time": 0, "amount": 0, "released": True})
     daily_bonus_db.setdefault(uid, 0)
     return user_db[uid], earnings_db[uid], escrow_db[uid], daily_bonus_db[uid]
@@ -381,30 +386,6 @@ def transfer_ifc(recipient, amount):
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": None, "message": str(e)}
 
-# ========== ESCROW LOGIC ==========
-def is_escrow_active(uid):
-    e = escrow_db.get(str(uid), {})
-    if not e or e.get("amount", 0) <= 0:
-        return False
-    hours_elapsed = (time.time() * 1000 - e.get("hold_time", 0)) / (1000 * 60 * 60)
-    return hours_elapsed < 24 and not e.get("released", True)
-
-def get_escrow_remaining_hours(uid):
-    e = escrow_db.get(str(uid), {})
-    if not e.get("hold_time"):
-        return 0
-    elapsed_ms = time.time() * 1000 - e["hold_time"]
-    remaining_ms = (24 * 60 * 60 * 1000) - elapsed_ms
-    return max(0, remaining_ms / (1000 * 60 * 60))
-
-def start_escrow(uid, amount):
-    escrow_db[str(uid)] = {"hold_time": int(time.time() * 1000), "amount": amount, "released": False}
-
-def clear_escrow(uid):
-    if str(uid) in escrow_db:
-        escrow_db[str(uid)]["released"] = True
-        escrow_db[str(uid)]["amount"] = 0
-
 # ========== DAILY COOLDOWN ==========
 def is_daily_available(uid):
     last = daily_bonus_db.get(str(uid), 0)
@@ -449,10 +430,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Earned: {e['total_earned']:,} INFINITE",
         f"Unclaimed: {e['unclaimed']:,} INFINITE",
     ]
-    if is_escrow_active(uid):
-        esc_data = escrow_db.get(uid, {})
-        remaining = get_escrow_remaining_hours(uid)
-        status_lines.append(f"Escrow: {esc_data.get('amount', 0):,} INFINITE ({remaining:.1f}h left)")
     status_lines.extend(["", "/play - Launch game", "/wallet - Connect Phantom (1x only)",
         "/balance - Check INFINITE & holder status", "/claim - Claim INFINITE",
         "/daily - Daily bonus (500 INFINITE)", "/help - How to play"])
@@ -512,7 +489,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if holder:
             lines.append("Tier: \U0001F48E *HOLDER* — 500K/day claim cap")
         else:
-            lines.append(f"Tier: \U0001F464 *Free* — 10K/day claim cap")
+            lines.append("Tier: \U0001F464 *Free* — 10K/day claim cap")
             if req:
                 lines.append(f"Hold {req:,.0f} INFINITE to unlock 500K/day")
         lines.append("Status: *Ready to claim*")
@@ -531,7 +508,6 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if e['unclaimed'] <= 0:
         await update.message.reply_text("No INFINITE to claim. /play to earn!"); return
 
-    # Check 24h cooldown
     last_claim = e.get("last_claim_time", 0)
     hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
     if hours_since < CLAIM_COOLDOWN:
@@ -638,7 +614,8 @@ def wallet_callback():
 def api_wallet():
     data = request.get_json() or {}
     wallet = data.get("wallet_address", "").strip()
-    uid = str(data.get("telegram_user_id", ""))
+    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
+    logger.info("API /api/wallet uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
     if not wallet or not uid or len(wallet) < 32:
         return jsonify({"error": "Invalid"}), 400
 
@@ -658,39 +635,51 @@ def api_wallet():
 @app.route("/api/earnings", methods=["POST"])
 def api_earnings():
     data = request.get_json() or {}
-    uid = str(data.get("telegram_user_id", ""))
+    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     amount = int(data.get("amount", 0))
-    if not uid: return jsonify({"error": "Missing user_id"}), 400
+    logger.info("API /api/earnings uid=%s amount=%s", uid, amount)
+    if not uid:
+        logger.warning("API /api/earnings rejected: missing uid")
+        return jsonify({"error": "Missing user_id"}), 400
     _, e, _, _ = get_db(uid)
-    e["total_earned"] += amount; e["unclaimed"] += amount
+    e["total_earned"] += amount
+    e["unclaimed"] += amount
     _save_json(EARNINGS_DB_FILE, earnings_db)
+    logger.info("API /api/earnings saved: uid=%s total=%s unclaimed=%s", uid, e["total_earned"], e["unclaimed"])
     return jsonify({"success": True, "unclaimed": e["unclaimed"]})
 
 @app.route("/api/claim", methods=["POST"])
 def api_claim():
     data = request.get_json() or {}
-    uid = str(data.get("telegram_user_id", ""))
+    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
+    logger.info("API /api/claim uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
 
-    if not uid or not wallet: return jsonify({"error": "Invalid"}), 400
+    if not uid or not wallet:
+        logger.warning("API /api/claim rejected: missing uid or wallet")
+        return jsonify({"error": "Invalid"}), 400
 
     _, e, _, _ = get_db(uid)
+    logger.info("API /api/claim state: unclaimed=%s total_claimed=%s", e['unclaimed'], e['total_claimed'])
 
     if e['unclaimed'] <= 0:
+        logger.info("API /api/claim rejected: zero unclaimed")
         return jsonify({"success": False, "message": "No IFC to claim"})
 
-    # Check 24h cooldown
     last_claim = e.get("last_claim_time", 0)
     hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
     if hours_since < CLAIM_COOLDOWN:
         remaining = CLAIM_COOLDOWN - hours_since
+        logger.info("API /api/claim rejected: cooldown %.1fh", remaining)
         return jsonify({"success": False, "message": "Cooldown: %.1fh remaining" % remaining, "cooldown": True})
 
     claimable = calculate_claimable(e['unclaimed'], wallet)
+    logger.info("API /api/claim claimable=%s (wallet=%s)", claimable, wallet[:6])
     if claimable <= 0:
         return jsonify({"success": False, "message": "Nothing to claim"})
 
     result = transfer_ifc(wallet, claimable)
+    logger.info("API /api/claim transfer result: %s", result.get('success'))
 
     if result.get('success'):
         e['total_claimed'] += claimable
@@ -698,18 +687,25 @@ def api_claim():
         e["last_claim_time"] = int(time.time() * 1000)
         _save_json(EARNINGS_DB_FILE, earnings_db)
         tier = "HOLDER" if is_holder(wallet) else "Free"
+        logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s)", claimable, tier)
         return jsonify({"success": True, "tx": result.get("tx"), "amount": claimable, "message": f"{tier}: {result['message']}"})
 
+    logger.error("API /api/claim FAILED: %s", result.get('message'))
     return jsonify({"success": False, "message": result.get("message", "Transfer failed")})
 
 @app.route("/api/daily", methods=["POST"])
 def api_daily():
     data = request.get_json() or {}
-    uid = str(data.get("telegram_user_id", ""))
+    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
-    if not uid: return jsonify({"error": "Missing"}), 400
-    if not is_daily_available(uid): return jsonify({"success": False, "message": "Cooldown"})
+    logger.info("API /api/daily uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
+    if not uid:
+        return jsonify({"error": "Missing"}), 400
+    if not is_daily_available(uid):
+        logger.info("API /api/daily rejected: uid cooldown")
+        return jsonify({"success": False, "message": "Cooldown"})
     if wallet and not is_daily_available_by_wallet(wallet):
+        logger.info("API /api/daily rejected: wallet cooldown")
         return jsonify({"success": False, "message": "Wallet already claimed daily bonus today"})
 
     daily_bonus_db[uid] = int(time.time() * 1000)
@@ -719,6 +715,7 @@ def api_daily():
         _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
 
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
+    logger.info("API /api/daily transfer: %s", result.get('success'))
     return jsonify({"success": True, "tx": result.get("tx", ""), "transferred": result.get("success", False)})
 
 @app.route("/api/balance/<uid>", methods=["GET"])
@@ -735,6 +732,7 @@ def api_get_balance(uid):
             "is_holder": holder,
             "daily_cap": HOLDER_CAP if holder else FREE_CAP
         })
+    logger.info("API /api/balance/%s: unclaimed=%s", uid, e['unclaimed'])
     return jsonify(result)
 
 # ========== LEADERBOARD ROUTES ==========
@@ -742,13 +740,16 @@ def api_get_balance(uid):
 def api_score():
     data = request.get_json() or {}
     wallet = data.get("wallet_address", "").strip()
-    distance = int(data.get("distance", 0))
+    distance = int(data.get("distance", data.get("score", 0)))
     username = data.get("username", "Anonymous")
+    logger.info("API /api/score wallet=%s... distance=%s username=%s", wallet[:6] if wallet else "none", distance, username)
 
     if not wallet or len(wallet) < 32 or distance < 0:
+        logger.warning("API /api/score rejected: invalid wallet or distance")
         return jsonify({"error": "Invalid"}), 400
 
     existing = high_scores_db.get(wallet, {"best_distance": 0})
+    new_record = False
     if distance > existing.get("best_distance", 0):
         high_scores_db[wallet] = {
             "best_distance": distance,
@@ -756,8 +757,11 @@ def api_score():
             "last_updated": time.time()
         }
         _save_json(HIGHSCORE_DB_FILE, high_scores_db)
-        return jsonify({"success": True, "new_record": True, "best_distance": distance})
-    return jsonify({"success": True, "new_record": False, "best_distance": existing.get("best_distance", 0)})
+        new_record = True
+        logger.info("API /api/score NEW RECORD: %s -> %sm", wallet[:6], distance)
+    else:
+        logger.info("API /api/score no record: %s vs %s", distance, existing.get("best_distance", 0))
+    return jsonify({"success": True, "new_record": new_record, "best_distance": high_scores_db[wallet].get("best_distance", distance)})
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
@@ -776,6 +780,7 @@ def api_leaderboard():
             "username": data.get("username", "Anonymous"),
             "distance": data.get("best_distance", 0)
         })
+    logger.info("API /api/leaderboard: returning %s entries", len(leaderboard))
     return jsonify({"leaderboard": leaderboard, "total_players": len(high_scores_db)})
 
 @app.route("/api/highscore/<wallet>", methods=["GET"])
