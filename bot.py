@@ -892,7 +892,16 @@ def api_daily():
 
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
+    # Get wallet from DB or query param (game sends it directly)
     wallet = user_db.get(str(uid), {}).get("wallet", "")
+    query_wallet = request.args.get("wallet", "").strip()
+    if not wallet and query_wallet and len(query_wallet) >= 32:
+        wallet = query_wallet
+        # Auto-save to DB for future requests
+        user_db.setdefault(str(uid), {})["wallet"] = wallet
+        _save_json(USER_DB_FILE, user_db)
+        logger.info("Auto-saved wallet from query param for uid=%s: %s...", uid, wallet[:6])
+
     _, e, _, _ = get_db(uid)
     cap = get_daily_cap(wallet)
     claimed, _, _ = get_daily_claimed(uid)
@@ -914,7 +923,10 @@ def api_get_balance(uid):
             "wallet_balance": bal['balance'],
             "can_claim": True,
         })
-    logger.info("API /api/balance/%s: unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
+        logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s", 
+                    uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
+    else:
+        logger.info("API /api/balance/%s: NO WALLET unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
     return jsonify(result)
 
 # ========== LEADERBOARD ROUTES ==========
