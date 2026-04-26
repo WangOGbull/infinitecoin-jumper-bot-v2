@@ -3,7 +3,7 @@ Infinitecoin Jumper Bot - Holder Model v5
 Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 500K/day total
 Wallet locked 1x forever. Daily claim tracking resets 24h after first claim.
 """
-import os, json, logging, time, requests, asyncio, threading, base64, struct
+import os, json, logging, time, requests, asyncio, threading, base64, struct, sqlite3
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -84,6 +84,49 @@ CORS(app, origins="*", supports_credentials=True)
 # ========== DATABASE PERSISTENCE ==========
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ========== SQLITE LEADERBOARD ==========
+DB_PATH = os.path.join(DATA_DIR, "leaderboard.db")
+
+def _init_sqlite():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS high_scores (wallet TEXT PRIMARY KEY, best_distance INTEGER NOT NULL, username TEXT, last_updated REAL)")
+    conn.commit()
+    conn.close()
+
+_init_sqlite()
+
+def _save_score_sqlite(wallet, distance, username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO high_scores (wallet, best_distance, username, last_updated) VALUES (?, ?, ?, ?) ON CONFLICT(wallet) DO UPDATE SET best_distance = excluded.best_distance, username = excluded.username, last_updated = excluded.last_updated WHERE excluded.best_distance > high_scores.best_distance", (wallet, distance, username, time.time()))
+    conn.commit()
+    conn.close()
+
+def _get_leaderboard_sqlite(limit=10):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT wallet, best_distance, username FROM high_scores ORDER BY best_distance DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def _get_best_sqlite(wallet):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT best_distance FROM high_scores WHERE wallet = ?", (wallet,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def _count_players_sqlite():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM high_scores")
+    count = c.fetchone()[0]
+    conn.close()
+    return count
 
 USER_DB_FILE = os.path.join(DATA_DIR, "users.json")
 EARNINGS_DB_FILE = os.path.join(DATA_DIR, "earnings.json")
@@ -942,6 +985,10 @@ def api_score():
         logger.warning("API /api/score rejected: invalid wallet or distance")
         return jsonify({"error": "Invalid"}), 400
 
+    # Save to SQLite (persists across restarts)
+    _save_score_sqlite(wallet, distance, username)
+
+    # Also update in-memory for compatibility
     existing = high_scores_db.get(wallet, {"best_distance": 0})
     new_record = False
     if distance > existing.get("best_distance", 0):
@@ -955,37 +1002,35 @@ def api_score():
         logger.info("API /api/score NEW RECORD: %s -> %sm", wallet[:6], distance)
     else:
         logger.info("API /api/score no record: %s vs %s", distance, existing.get("best_distance", 0))
-    return jsonify({"success": True, "new_record": new_record, "best_distance": high_scores_db[wallet].get("best_distance", distance)})
+
+    best = _get_best_sqlite(wallet)
+    return jsonify({"success": True, "new_record": new_record, "best_distance": best})
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    sorted_scores = sorted(
-        high_scores_db.items(),
-        key=lambda x: x[1].get("best_distance", 0),
-        reverse=True
-    )[:10]
-
+    rows = _get_leaderboard_sqlite(10)
     leaderboard = []
-    for rank, (wallet, data) in enumerate(sorted_scores, 1):
+    for rank, (wallet, distance, username) in enumerate(rows, 1):
         leaderboard.append({
             "rank": rank,
             "wallet": wallet[:4] + "..." + wallet[-4:],
             "full_wallet": wallet,
-            "username": data.get("username", "Anonymous"),
-            "distance": data.get("best_distance", 0)
+            "username": username or "Anonymous",
+            "distance": distance
         })
-    logger.info("API /api/leaderboard: returning %s entries", len(leaderboard))
-    return jsonify({"leaderboard": leaderboard, "total_players": len(high_scores_db)})
+    total = _count_players_sqlite()
+    logger.info("API /api/leaderboard: returning %s entries (total: %s)", len(leaderboard), total)
+    return jsonify({"leaderboard": leaderboard, "total_players": total})
 
 @app.route("/api/highscore/<wallet>", methods=["GET"])
 def api_highscore(wallet):
     w = wallet.strip()
     if not w or len(w) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
-    data = high_scores_db.get(w, {"best_distance": 0, "username": "Anonymous"})
+    best = _get_best_sqlite(w)
     return jsonify({
-        "best_distance": data.get("best_distance", 0),
-        "username": data.get("username", "Anonymous")
+        "best_distance": best,
+        "username": "Anonymous"
     })
 
 @app.route("/setup-webhook")
