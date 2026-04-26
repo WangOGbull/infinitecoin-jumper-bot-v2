@@ -1,7 +1,7 @@
 """
-Infinitecoin Jumper Bot - Holder Model v4
-Free: 10K/day | Holders (0.1 SOL worth INFINITE): 500K/day
-Wallet locked 1x forever. Heavy API logging for debug.
+Infinitecoin Jumper Bot - Holder Model v5
+Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 500K/day total
+Wallet locked 1x forever. Daily claim tracking resets 24h after first claim.
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct
 from datetime import datetime, timezone
@@ -77,7 +77,6 @@ def get_sol_price():
 FREE_CAP = 10000
 HOLDER_CAP = 500000
 DAILY_BONUS_AMOUNT = 500
-CLAIM_COOLDOWN = 24
 
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
@@ -92,6 +91,7 @@ ESCROW_DB_FILE = os.path.join(DATA_DIR, "escrow.json")
 DAILY_DB_FILE = os.path.join(DATA_DIR, "daily.json")
 WALLET_DAILY_DB_FILE = os.path.join(DATA_DIR, "wallet_daily.json")
 HIGHSCORE_DB_FILE = os.path.join(DATA_DIR, "highscores.json")
+DAILY_CLAIMED_DB_FILE = os.path.join(DATA_DIR, "daily_claimed.json")
 
 def _load_json(path, default):
     try:
@@ -115,6 +115,7 @@ escrow_db = _load_json(ESCROW_DB_FILE, {})
 daily_bonus_db = _load_json(DAILY_DB_FILE, {})
 wallet_daily_db = _load_json(WALLET_DAILY_DB_FILE, {})
 high_scores_db = _load_json(HIGHSCORE_DB_FILE, {})
+daily_claimed_db = _load_json(DAILY_CLAIMED_DB_FILE, {})
 
 logger.info("Loaded DBs: users=%s earnings=%s scores=%s", len(user_db), len(earnings_db), len(high_scores_db))
 
@@ -261,18 +262,62 @@ def _setup_solana():
 
 _setup_solana()
 
-# ========== DATABASE ==========
-def calculate_claimable(unclaimed, wallet_address):
-    if unclaimed <= 0:
-        return 0
-    if wallet_address and is_holder(wallet_address):
-        return min(unclaimed, HOLDER_CAP)
-    return min(unclaimed, FREE_CAP)
+# ========== DAILY CLAIM TRACKING ==========
+def get_daily_claimed(uid):
+    """Get total INFINITE claimed today by this user."""
+    record = daily_claimed_db.get(str(uid), {})
+    if not record:
+        return 0, 0, True
+    first_claim = record.get("first_claim", 0)
+    total = record.get("total", 0)
+    if first_claim == 0:
+        return 0, 0, True
+    hours_since = (time.time() * 1000 - first_claim) / (1000 * 60 * 60)
+    if hours_since >= 24:
+        return 0, 0, True
+    return total, first_claim, False
 
+def add_daily_claimed(uid, amount):
+    """Add to today's claimed total."""
+    uid = str(uid)
+    record = daily_claimed_db.get(uid, {})
+    if not record or not record.get("first_claim"):
+        daily_claimed_db[uid] = {"first_claim": int(time.time() * 1000), "total": amount}
+    else:
+        daily_claimed_db[uid]["total"] = record.get("total", 0) + amount
+    _save_json(DAILY_CLAIMED_DB_FILE, daily_claimed_db)
+
+def get_daily_cap(wallet_address):
+    if wallet_address and is_holder(wallet_address):
+        return HOLDER_CAP
+    return FREE_CAP
+
+def get_daily_remaining(uid, wallet_address):
+    cap = get_daily_cap(wallet_address)
+    claimed, _, _ = get_daily_claimed(uid)
+    return max(0, cap - claimed)
+
+def get_daily_reset_time(uid):
+    _, first_claim, _ = get_daily_claimed(uid)
+    if first_claim == 0:
+        return 0
+    reset_ms = first_claim + (24 * 60 * 60 * 1000)
+    remaining_ms = reset_ms - int(time.time() * 1000)
+    return max(0, remaining_ms)
+
+def get_daily_reset_text(uid):
+    ms = get_daily_reset_time(uid)
+    if ms <= 0:
+        return "Resets now"
+    hours = int(ms / (1000 * 60 * 60))
+    mins = int((ms % (1000 * 60 * 60)) / (1000 * 60))
+    return f"{hours}h {mins}m"
+
+# ========== DATABASE ==========
 def get_db(user_id):
     uid = str(user_id)
     user_db.setdefault(uid, {})
-    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0, "last_claim_time": 0})
+    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0})
     escrow_db.setdefault(uid, {"hold_time": 0, "amount": 0, "released": True})
     daily_bonus_db.setdefault(uid, 0)
     return user_db[uid], earnings_db[uid], escrow_db[uid], daily_bonus_db[uid]
@@ -423,12 +468,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet = user_db.get(uid, {}).get("wallet")
     wallet_text = f"`{wallet[:4]}...{wallet[-4:]}`" if wallet else "*Not connected*"
     holder_status = "\U0001F48E HOLDER" if (wallet and is_holder(wallet)) else "\U0001F464 Free"
+    cap = HOLDER_CAP if (wallet and is_holder(wallet)) else FREE_CAP
+    claimed, _, _ = get_daily_claimed(uid)
+    remaining = max(0, cap - claimed)
     status_lines = [
         "*Infinitecoin Jumper*", "_Collect coins. Avoid viruses. Earn INFINITE._", "",
         f"Status: {holder_status}",
         f"Wallet: {wallet_text}",
         f"Earned: {e['total_earned']:,} INFINITE",
         f"Unclaimed: {e['unclaimed']:,} INFINITE",
+        f"Claimed today: {claimed:,} / {cap:,} INFINITE",
     ]
     status_lines.extend(["", "/play - Launch game", "/wallet - Connect Phantom (1x only)",
         "/balance - Check INFINITE & holder status", "/claim - Claim INFINITE",
@@ -485,6 +534,9 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = has_minimum_balance(wallet)
         holder = is_holder(wallet)
         req = get_required_infinite_for_holder()
+        cap = HOLDER_CAP if holder else FREE_CAP
+        claimed, _, _ = get_daily_claimed(uid)
+        remaining = max(0, cap - claimed)
         lines.append(f"Balance: {bal['balance']:,.2f} INFINITE (${bal['usd_value']:.6f})")
         if holder:
             lines.append("Tier: \U0001F48E *HOLDER* — 500K/day claim cap")
@@ -492,6 +544,8 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Tier: \U0001F464 *Free* — 10K/day claim cap")
             if req:
                 lines.append(f"Hold {req:,.0f} INFINITE to unlock 500K/day")
+        lines.append(f"Claimed today: {claimed:,} / {cap:,} INFINITE")
+        lines.append(f"Remaining today: {remaining:,} INFINITE")
         lines.append("Status: *Ready to claim*")
     else:
         lines.append("Wallet: *Not connected*")
@@ -508,13 +562,19 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if e['unclaimed'] <= 0:
         await update.message.reply_text("No INFINITE to claim. /play to earn!"); return
 
-    last_claim = e.get("last_claim_time", 0)
-    hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
-    if hours_since < CLAIM_COOLDOWN:
-        remaining = CLAIM_COOLDOWN - hours_since
-        await update.message.reply_text(f"Claim cooldown: {remaining:.1f}h remaining."); return
+    cap = get_daily_cap(wallet)
+    claimed, _, reset = get_daily_claimed(uid)
+    remaining = max(0, cap - claimed)
 
-    claimable = calculate_claimable(e['unclaimed'], wallet)
+    if remaining <= 0:
+        req = get_required_infinite_for_holder()
+        reset_text = get_daily_reset_text(uid)
+        msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today\nResets in: {reset_text}"
+        if not is_holder(wallet) and req:
+            msg += f"\n\nHold {req:,.0f} INFINITE (0.1 SOL) to unlock 500K/day"
+        await update.message.reply_text(msg); return
+
+    claimable = min(e['unclaimed'], remaining)
     if claimable <= 0:
         await update.message.reply_text("Nothing to claim."); return
 
@@ -522,7 +582,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result['success']:
         e['total_claimed'] += claimable
         e['unclaimed'] -= claimable
-        e["last_claim_time"] = int(time.time() * 1000)
+        add_daily_claimed(uid, claimable)
         _save_json(EARNINGS_DB_FILE, earnings_db)
 
     tier = "HOLDER" if is_holder(wallet) else "Free"
@@ -560,8 +620,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req_text = f"Hold {req:,.0f} INFINITE to unlock 500K/day" if req else ""
     await update.message.reply_text(
         f"*How to Play*\nArrows: Move | Space: Jump\n\n*Claims*\n"
-        f"\U0001F464 Free: 10K/day max\n"
-        f"\U0001F48E Holders: 500K/day max\n"
+        f"\U0001F464 Free: 10K/day total (claim multiple times)\n"
+        f"\U0001F48E Holders: 500K/day total (claim multiple times)\n"
         f"{req_text}\n"
         f"- Daily: {DAILY_BONUS_AMOUNT} FREE INFINITE/24h\n\n"
         f"/play /wallet /claim /daily /balance",
@@ -579,6 +639,20 @@ def index():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "users": len(user_db), "escrow_ready": escrow_ready})
+
+@app.route("/api/status")
+def api_status():
+    """Return current caps and holder requirement for the game."""
+    req = get_required_infinite_for_holder()
+    sol_price = get_sol_price()
+    return jsonify({
+        "free_cap": FREE_CAP,
+        "holder_cap": HOLDER_CAP,
+        "holder_required_infinite": req,
+        "sol_price": sol_price,
+        "infinite_price": get_token_price(),
+        "mint_address": IFC_MINT
+    })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -666,15 +740,21 @@ def api_claim():
         logger.info("API /api/claim rejected: zero unclaimed")
         return jsonify({"success": False, "message": "No IFC to claim"})
 
-    last_claim = e.get("last_claim_time", 0)
-    hours_since = (time.time() * 1000 - last_claim) / (1000 * 60 * 60) if last_claim else 999
-    if hours_since < CLAIM_COOLDOWN:
-        remaining = CLAIM_COOLDOWN - hours_since
-        logger.info("API /api/claim rejected: cooldown %.1fh", remaining)
-        return jsonify({"success": False, "message": "Cooldown: %.1fh remaining" % remaining, "cooldown": True})
+    cap = get_daily_cap(wallet)
+    claimed, _, reset = get_daily_claimed(uid)
+    remaining = max(0, cap - claimed)
 
-    claimable = calculate_claimable(e['unclaimed'], wallet)
-    logger.info("API /api/claim claimable=%s (wallet=%s)", claimable, wallet[:6])
+    if remaining <= 0:
+        reset_text = get_daily_reset_text(uid)
+        req = get_required_infinite_for_holder()
+        msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today. Resets in {reset_text}."
+        if not is_holder(wallet) and req:
+            msg += f" Hold {req:,.0f} INFINITE (0.1 SOL) to unlock 500K/day."
+        logger.info("API /api/claim rejected: cap reached %s/%s", claimed, cap)
+        return jsonify({"success": False, "message": msg, "cap_reached": True, "daily_claimed": claimed, "daily_cap": cap, "resets_in": reset_text})
+
+    claimable = min(e['unclaimed'], remaining)
+    logger.info("API /api/claim claimable=%s (cap=%s claimed=%s remaining=%s)", claimable, cap, claimed, remaining)
     if claimable <= 0:
         return jsonify({"success": False, "message": "Nothing to claim"})
 
@@ -684,11 +764,21 @@ def api_claim():
     if result.get('success'):
         e['total_claimed'] += claimable
         e['unclaimed'] -= claimable
-        e["last_claim_time"] = int(time.time() * 1000)
+        add_daily_claimed(uid, claimable)
         _save_json(EARNINGS_DB_FILE, earnings_db)
         tier = "HOLDER" if is_holder(wallet) else "Free"
-        logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s)", claimable, tier)
-        return jsonify({"success": True, "tx": result.get("tx"), "amount": claimable, "message": f"{tier}: {result['message']}"})
+        new_claimed, _, _ = get_daily_claimed(uid)
+        new_remaining = max(0, cap - new_claimed)
+        logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s), daily=%s/%s", claimable, tier, new_claimed, cap)
+        return jsonify({
+            "success": True,
+            "tx": result.get("tx"),
+            "amount": claimable,
+            "message": f"{tier}: {result['message']}",
+            "daily_claimed": new_claimed,
+            "daily_cap": cap,
+            "daily_remaining": new_remaining
+        })
 
     logger.error("API /api/claim FAILED: %s", result.get('message'))
     return jsonify({"success": False, "message": result.get("message", "Transfer failed")})
@@ -699,13 +789,9 @@ def api_daily():
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
     logger.info("API /api/daily uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
-    if not uid:
-        return jsonify({"error": "Missing"}), 400
-    if not is_daily_available(uid):
-        logger.info("API /api/daily rejected: uid cooldown")
-        return jsonify({"success": False, "message": "Cooldown"})
+    if not uid: return jsonify({"error": "Missing"}), 400
+    if not is_daily_available(uid): return jsonify({"success": False, "message": "Cooldown"})
     if wallet and not is_daily_available_by_wallet(wallet):
-        logger.info("API /api/daily rejected: wallet cooldown")
         return jsonify({"success": False, "message": "Wallet already claimed daily bonus today"})
 
     daily_bonus_db[uid] = int(time.time() * 1000)
@@ -722,17 +808,26 @@ def api_daily():
 def api_get_balance(uid):
     wallet = user_db.get(str(uid), {}).get("wallet", "")
     _, e, _, _ = get_db(uid)
-    result = {"earned": e['total_earned'], "unclaimed": e['unclaimed'], "claimed": e['total_claimed']}
+    cap = get_daily_cap(wallet)
+    claimed, _, _ = get_daily_claimed(uid)
+    remaining = max(0, cap - claimed)
+    result = {
+        "earned": e['total_earned'],
+        "unclaimed": e['unclaimed'],
+        "claimed": e['total_claimed'],
+        "daily_cap": cap,
+        "daily_claimed": claimed,
+        "daily_remaining": remaining
+    }
     if wallet:
         bal = has_minimum_balance(wallet)
         holder = is_holder(wallet)
         result.update({
-            "wallet_balance": bal['balance'], 
+            "wallet_balance": bal['balance'],
             "can_claim": True,
             "is_holder": holder,
-            "daily_cap": HOLDER_CAP if holder else FREE_CAP
         })
-    logger.info("API /api/balance/%s: unclaimed=%s", uid, e['unclaimed'])
+    logger.info("API /api/balance/%s: unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
     return jsonify(result)
 
 # ========== LEADERBOARD ROUTES ==========
