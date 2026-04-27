@@ -1033,13 +1033,20 @@ def api_score():
     wallet = data.get("wallet_address", "").strip()
     distance = int(data.get("distance", data.get("score", 0)))
     username = data.get("username", "Anonymous")
-    logger.info("API /api/score wallet=%s... distance=%s username=%s", wallet[:6] if wallet else "none", distance, username)
+    logger.info("API /api/score REQUEST wallet=%s... distance=%s username=%s", wallet[:6] if wallet else "none", distance, username)
 
-    if not wallet or len(wallet) < 32 or distance < 0:
-        logger.warning("API /api/score rejected: invalid wallet or distance")
-        return jsonify({"error": "Invalid"}), 400
+    if not wallet:
+        logger.warning("API /api/score REJECTED: no wallet")
+        return jsonify({"error": "No wallet"}), 400
+    if len(wallet) < 32:
+        logger.warning("API /api/score REJECTED: wallet too short (%s chars)", len(wallet))
+        return jsonify({"error": "Invalid wallet"}), 400
+    if distance < 0:
+        logger.warning("API /api/score REJECTED: negative distance")
+        return jsonify({"error": "Invalid distance"}), 400
 
-    # Save to SQLite (persists across restarts)
+    # Save to Supabase
+    logger.info("API /api/score saving to Supabase: %s... -> %s", wallet[:6], distance)
     _save_score_supabase(wallet, distance, username)
 
     # Also update in-memory for compatibility
@@ -1058,6 +1065,7 @@ def api_score():
         logger.info("API /api/score no record: %s vs %s", distance, existing.get("best_distance", 0))
 
     best = _get_best_supabase(wallet)
+    logger.info("API /api/score SUCCESS: best=%s new_record=%s", best, new_record)
     return jsonify({"success": True, "new_record": new_record, "best_distance": best})
 
 @app.route("/api/leaderboard", methods=["GET"])
