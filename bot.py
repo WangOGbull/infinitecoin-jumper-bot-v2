@@ -1,6 +1,6 @@
 """
 Infinitecoin Jumper Bot - Holder Model v5
-Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 500K/day total
+Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 150K/day total
 Wallet locked 1x forever. Daily claim tracking resets 24h after first claim.
 """
 import os, json, logging, time, requests, asyncio, threading, base64, struct, sqlite3
@@ -75,7 +75,7 @@ def get_sol_price():
 
 # ========== CLAIM CAPS ==========
 FREE_CAP = 10000
-HOLDER_CAP = 500000
+HOLDER_CAP = 150000
 DAILY_BONUS_AMOUNT = 500
 
 app = Flask(__name__)
@@ -683,7 +683,7 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = get_db(uid)[0].get("wallet")
     if existing:
         holder = is_holder(existing)
-        tier = "\U0001F48E HOLDER (500K/day)" if holder else "\U0001F464 Free (10K/day)"
+        tier = "\U0001F48E HOLDER (150K/day)" if holder else "\U0001F464 Free (10K/day)"
         await update.message.reply_text(
             f"Wallet locked: `{existing[:4]}...{existing[-4:]}`\n{tier}\nUse /balance or /claim.", parse_mode="Markdown")
         return
@@ -724,11 +724,11 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = max(0, cap - claimed)
         lines.append(f"Balance: {bal['balance']:,.2f} INFINITE (${bal['usd_value']:.6f})")
         if holder:
-            lines.append("Tier: \U0001F48E *HOLDER* — 500K/day claim cap")
+            lines.append("Tier: \U0001F48E *HOLDER* — 150K/day claim cap")
         else:
             lines.append("Tier: \U0001F464 *Free* — 10K/day claim cap")
             if req:
-                lines.append(f"Hold {req:,.0f} INFINITE to unlock 500K/day")
+                lines.append(f"Hold {req:,.0f} INFINITE to unlock 150K/day")
         lines.append(f"Claimed today: {claimed:,} / {cap:,} INFINITE")
         lines.append(f"Remaining today: {remaining:,} INFINITE")
         lines.append("Status: *Ready to claim*")
@@ -756,7 +756,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reset_text = get_daily_reset_text(uid)
         msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today\nResets in: {reset_text}"
         if not is_holder(wallet) and req:
-            msg += f"\n\nHold {req:,.0f} INFINITE (0.1 SOL) to unlock 500K/day"
+            msg += f"\n\nHold {req:,.0f} INFINITE (0.1 SOL) to unlock 150K/day"
         await update.message.reply_text(msg); return
 
     claimable = min(e['unclaimed'], remaining)
@@ -802,11 +802,11 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = get_required_infinite_for_holder()
-    req_text = f"Hold {req:,.0f} INFINITE to unlock 500K/day" if req else ""
+    req_text = f"Hold {req:,.0f} INFINITE to unlock 150K/day" if req else ""
     await update.message.reply_text(
         f"*How to Play*\nArrows: Move | Space: Jump\n\n*Claims*\n"
         f"\U0001F464 Free: 10K/day total (claim multiple times)\n"
-        f"\U0001F48E Holders: 500K/day total (claim multiple times)\n"
+        f"\U0001F48E Holders: 150K/day total (claim multiple times)\n"
         f"{req_text}\n"
         f"- Daily: {DAILY_BONUS_AMOUNT} FREE INFINITE/24h\n\n"
         f"/play /wallet /claim /daily /balance",
@@ -957,7 +957,7 @@ def api_claim():
         req = get_required_infinite_for_holder()
         msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today. Resets in {reset_text}."
         if not is_holder(wallet) and req:
-            msg += f" Hold {req:,.0f} INFINITE (0.1 SOL) to unlock 500K/day."
+            msg += f" Hold {req:,.0f} INFINITE (0.1 SOL) to unlock 150K/day."
         logger.info("API /api/claim rejected: cap reached %s/%s", claimed, cap)
         return jsonify({"success": False, "message": msg, "cap_reached": True, "daily_claimed": claimed, "daily_cap": cap, "resets_in": reset_text})
 
