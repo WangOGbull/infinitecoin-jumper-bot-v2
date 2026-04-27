@@ -20,6 +20,8 @@ GAME_URL = os.environ.get("GAME_URL", "https://your-game.vercel.app").rstrip("/"
 IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjmpnj1fhzpump")
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # Token prices
 IFC_PRICE_USD = None
@@ -97,36 +99,88 @@ def _init_sqlite():
 
 _init_sqlite()
 
-def _save_score_sqlite(wallet, distance, username):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO high_scores (wallet, best_distance, username, last_updated) VALUES (?, ?, ?, ?) ON CONFLICT(wallet) DO UPDATE SET best_distance = excluded.best_distance, username = excluded.username, last_updated = excluded.last_updated WHERE excluded.best_distance > high_scores.best_distance", (wallet, distance, username, time.time()))
-    conn.commit()
-    conn.close()
+def _save_score_supabase(wallet, distance, username):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates"
+        }
+        payload = {
+            "wallet": wallet,
+            "best_distance": distance,
+            "username": username,
+            "last_updated": int(time.time())
+        }
+        url = f"{SUPABASE_URL}/rest/v1/high_scores"
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.warning("Supabase save score HTTP %s: %s", resp.status_code, resp.text[:100])
+    except Exception as e:
+        logger.error("Supabase save score error: %s", e)
 
-def _get_leaderboard_sqlite(limit=10):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT wallet, best_distance, username FROM high_scores ORDER BY best_distance DESC LIMIT ?", (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+def _get_leaderboard_supabase(limit=10):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    try:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json"
+        }
+        url = f"{SUPABASE_URL}/rest/v1/high_scores?order=best_distance.desc&limit={limit}"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return [(r["wallet"], r["best_distance"], r.get("username", "Anonymous")) for r in data]
+        else:
+            logger.warning("Supabase leaderboard HTTP %s: %s", resp.status_code, resp.text[:100])
+            return []
+    except Exception as e:
+        logger.error("Supabase leaderboard error: %s", e)
+        return []
 
-def _get_best_sqlite(wallet):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT best_distance FROM high_scores WHERE wallet = ?", (wallet,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
+def _get_best_supabase(wallet):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+    try:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json"
+        }
+        url = f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&order=best_distance.desc&limit=1"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                return data[0]["best_distance"]
+        return 0
+    except Exception as e:
+        logger.error("Supabase best error: %s", e)
+        return 0
 
-def _count_players_sqlite():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM high_scores")
-    count = c.fetchone()[0]
-    conn.close()
-    return count
+def _count_players_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+    try:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json"
+        }
+        url = f"{SUPABASE_URL}/rest/v1/high_scores?select=wallet"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return len(data)
+        return 0
+    except Exception as e:
+        logger.error("Supabase count error: %s", e)
+        return 0
 
 USER_DB_FILE = os.path.join(DATA_DIR, "users.json")
 EARNINGS_DB_FILE = os.path.join(DATA_DIR, "earnings.json")
@@ -986,7 +1040,7 @@ def api_score():
         return jsonify({"error": "Invalid"}), 400
 
     # Save to SQLite (persists across restarts)
-    _save_score_sqlite(wallet, distance, username)
+    _save_score_supabase(wallet, distance, username)
 
     # Also update in-memory for compatibility
     existing = high_scores_db.get(wallet, {"best_distance": 0})
@@ -1003,12 +1057,12 @@ def api_score():
     else:
         logger.info("API /api/score no record: %s vs %s", distance, existing.get("best_distance", 0))
 
-    best = _get_best_sqlite(wallet)
+    best = _get_best_supabase(wallet)
     return jsonify({"success": True, "new_record": new_record, "best_distance": best})
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    rows = _get_leaderboard_sqlite(10)
+    rows = _get_leaderboard_supabase(10)
     leaderboard = []
     for rank, (wallet, distance, username) in enumerate(rows, 1):
         leaderboard.append({
@@ -1018,7 +1072,7 @@ def api_leaderboard():
             "username": username or "Anonymous",
             "distance": distance
         })
-    total = _count_players_sqlite()
+    total = _count_players_supabase()
     logger.info("API /api/leaderboard: returning %s entries (total: %s)", len(leaderboard), total)
     return jsonify({"leaderboard": leaderboard, "total_players": total})
 
@@ -1027,7 +1081,7 @@ def api_highscore(wallet):
     w = wallet.strip()
     if not w or len(w) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
-    best = _get_best_sqlite(w)
+    best = _get_best_supabase(w)
     return jsonify({
         "best_distance": best,
         "username": "Anonymous"
