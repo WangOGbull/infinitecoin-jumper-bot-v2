@@ -135,7 +135,7 @@ def _get_leaderboard_supabase(limit=10):
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Accept": "application/json"
         }
-        url = f"{SUPABASE_URL}/rest/v1/high_scores?order=best_distance.desc&limit={limit}"
+        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?order=best_distance.desc&limit={limit}"
         logger.info("Supabase GET leaderboard: %s", url)
         resp = requests.get(url, headers=headers, timeout=10)
         logger.info("Supabase leaderboard response: HTTP %s body=%s", resp.status_code, resp.text[:300])
@@ -159,7 +159,7 @@ def _get_best_supabase(wallet):
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Accept": "application/json"
         }
-        url = f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&order=best_distance.desc&limit=1"
+        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?wallet=eq.{wallet}&limit=1"
         logger.info("Supabase GET best: %s", url)
         resp = requests.get(url, headers=headers, timeout=10)
         logger.info("Supabase best response: HTTP %s body=%s", resp.status_code, resp.text[:200])
@@ -181,7 +181,7 @@ def _count_players_supabase():
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Accept": "application/json"
         }
-        url = f"{SUPABASE_URL}/rest/v1/high_scores?select=wallet"
+        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?select=wallet"
         logger.info("Supabase GET count: %s", url)
         resp = requests.get(url, headers=headers, timeout=10)
         logger.info("Supabase count response: HTTP %s body=%s", resp.status_code, resp.text[:200])
