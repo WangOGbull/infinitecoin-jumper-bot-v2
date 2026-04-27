@@ -204,8 +204,7 @@ def is_holder(wallet_address):
         if required is None:
             return False
         result = balance >= required
-        # Only cache if we got a positive result or a confirmed non-zero balance.
-        # This prevents caching a "False" caused by a temporary API failure.
+        # Only cache confirmed results, not API failures
         if result or balance > 0:
             _holder_cache[wallet_address] = (result, now)
         logger.info("Holder check %s...: %.4f / %.0f INFINITE -> %s",
@@ -371,68 +370,14 @@ def get_db(user_id):
 
 # ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
-    """Get INFINITE token balance via Solana RPC (primary) with API fallbacks."""
+    """Get INFINITE token balance via Solana RPC primary, Solscan fallback."""
     if not wallet_address or len(wallet_address) < 32:
         return 0
 
-    # Compute ATA address once for direct balance checks
-    recipient_ata_str = None
-    try:
-        from solders.pubkey import Pubkey
-        recipient_pk = Pubkey.from_string(wallet_address)
-        if get_associated_token_address:
-            recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
-            recipient_ata_str = str(recipient_ata)
-    except Exception as e:
-        logger.warning("ATA compute failed: %s", e)
-
-    endpoints = [
-        SOLANA_RPC,
-        "https://api.mainnet-beta.solana.com",
-        "https://solana-rpc.publicnode.com",
-        "https://rpc.ankr.com/solana"
-    ]
-
-    # Method 1: Direct getTokenAccountBalance on ATA (fastest & most reliable)
-    if recipient_ata_str:
-        balance_payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountBalance",
-            "params": [recipient_ata_str, {"commitment": "confirmed"}]
-        }
-        for url in endpoints:
-            try:
-                resp = requests.post(url, json=balance_payload, timeout=12,
-                                   headers={"Content-Type": "application/json"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if 'result' in data and 'value' in data['result']:
-                        val = data['result']['value']
-                        ui_amount = val.get('uiAmount')
-                        if ui_amount is not None:
-                            logger.info("Direct RPC balance (%s) for %s...: %.6f INFINITE",
-                                        url.split('/')[2], wallet_address[:6], float(ui_amount))
-                            return float(ui_amount)
-                        amount = int(val.get('amount', 0))
-                        decimals = int(val.get('decimals', 9))
-                        bal = amount / (10 ** decimals)
-                        logger.info("Direct RPC balance (%s) for %s...: %.6f INFINITE",
-                                    url.split('/')[2], wallet_address[:6], bal)
-                        return bal
-                    elif 'error' in data:
-                        err = data['error']
-                        msg = err.get('message', '') if isinstance(err, dict) else str(err)
-                        if 'could not find account' in msg.lower():
-                            logger.info("ATA not found for %s... (balance=0)", wallet_address[:6])
-                            return 0
-            except Exception as e:
-                logger.warning("Direct RPC fail %s: %s", url.split('/')[2], str(e)[:80])
-
-    # Method 2: getTokenAccountsByOwner (scans all token accounts)
+    # Primary: getTokenAccountsByOwner via multiple RPC endpoints
     payload = {
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": 1,
         "method": "getTokenAccountsByOwner",
         "params": [
             wallet_address,
@@ -440,6 +385,13 @@ def get_wallet_balance(wallet_address):
             {"encoding": "jsonParsed", "commitment": "confirmed"}
         ]
     }
+    endpoints = [
+        SOLANA_RPC,
+        "https://api.mainnet-beta.solana.com",
+        "https://solana-rpc.publicnode.com",
+        "https://rpc.ankr.com/solana"
+    ]
+
     for url in endpoints:
         try:
             resp = requests.post(url, json=payload, timeout=15,
@@ -448,32 +400,31 @@ def get_wallet_balance(wallet_address):
                 data = resp.json()
                 if 'result' in data and 'value' in data['result']:
                     accounts = data['result']['value']
-                    if accounts:
-                        total = 0
-                        for acc in accounts:
-                            try:
-                                info = acc['account']['data']['parsed']['info']
-                                token_amount = info.get('tokenAmount', {})
-                                ui_amount = token_amount.get('uiAmount')
-                                if ui_amount is not None:
-                                    total += float(ui_amount)
-                                else:
-                                    amount = int(token_amount.get('amount', 0))
-                                    decimals = int(token_amount.get('decimals', 9))
-                                    total += amount / (10 ** decimals)
-                            except Exception:
-                                pass
-                        if total > 0:
-                            logger.info("RPC gTAbO balance (%s) for %s...: %.6f INFINITE",
-                                        url.split('/')[2], wallet_address[:6], total)
-                            return total
-                    logger.info("RPC gTAbO (%s): no token accounts for %s... (balance=0)",
-                                url.split('/')[2], wallet_address[:6])
-                    return 0
+                    if not accounts:
+                        logger.info("RPC (%s): no token accounts for %s... (balance=0)",
+                                    url.split('/')[2], wallet_address[:6])
+                        return 0
+                    total = 0
+                    for acc in accounts:
+                        try:
+                            info = acc['account']['data']['parsed']['info']
+                            token_amount = info.get('tokenAmount', {})
+                            ui_amount = token_amount.get('uiAmount')
+                            if ui_amount is not None:
+                                total += float(ui_amount)
+                            else:
+                                amount = int(token_amount.get('amount', 0))
+                                decimals = int(token_amount.get('decimals', 9))
+                                total += amount / (10 ** decimals)
+                        except Exception:
+                            pass
+                    logger.info("RPC balance (%s) for %s...: %.6f INFINITE",
+                                url.split('/')[2], wallet_address[:6], total)
+                    return total
         except Exception as e:
-            logger.warning("RPC gTAbO fail %s: %s", url.split('/')[2], str(e)[:80])
+            logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:80])
 
-    # Method 3: Solscan API fallback
+    # Fallback: Solscan API
     try:
         url = f"https://public-api.solscan.io/account/tokens?address={wallet_address}"
         headers = {
@@ -484,7 +435,6 @@ def get_wallet_balance(wallet_address):
         logger.info("Solscan API status: %s for %s", resp.status_code, wallet_address[:6])
         if resp.status_code == 200:
             data = resp.json()
-            logger.info("Solscan response: %s", json.dumps(data)[:300])
             token_list = []
             if isinstance(data, list):
                 token_list = data
@@ -498,25 +448,6 @@ def get_wallet_balance(wallet_address):
                     return bal
     except Exception as e:
         logger.warning("Solscan API failed: %s", str(e)[:80])
-
-    # Method 4: solana_client library fallback
-    if escrow_ready and solana_client and get_associated_token_address:
-        try:
-            from solders.pubkey import Pubkey
-            recipient_pk = Pubkey.from_string(wallet_address)
-            recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
-            if not isinstance(recipient_ata, Pubkey):
-                recipient_ata = Pubkey.from_string(str(recipient_ata))
-            resp = solana_client.get_token_account_balance(recipient_ata)
-            if hasattr(resp, 'value') and resp.value:
-                ui_amount = resp.value.ui_amount
-                if ui_amount is not None:
-                    return float(ui_amount)
-                amount = int(resp.value.amount)
-                decimals = resp.value.decimals
-                return amount / (10 ** decimals)
-        except Exception as e:
-            logger.error("Client fallback failed: %s", e)
 
     logger.error("All balance methods failed for %s", wallet_address[:6])
     return 0
