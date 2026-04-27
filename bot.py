@@ -204,8 +204,11 @@ def is_holder(wallet_address):
         if required is None:
             return False
         result = balance >= required
-        _holder_cache[wallet_address] = (result, now)
-        logger.info("Holder check %s...: %.2f / %.0f INFINITE -> %s", wallet_address[:4], balance, required, result)
+        # Only cache confirmed results, not API failures
+        if result or balance > 0:
+            _holder_cache[wallet_address] = (result, now)
+        logger.info("Holder check %s...: %.4f / %.0f INFINITE -> %s",
+                    wallet_address[:4], balance, required, result)
         return result
     except Exception as e:
         logger.error("Holder check error: %s", e)
@@ -394,36 +397,54 @@ def get_wallet_balance(wallet_address):
     except Exception as e:
         logger.warning("Solscan API failed: %s", str(e)[:80])
 
-    # Fallback 1: HTTP RPC to Solana
+    # Fallback 1: HTTP RPC to Solana (stronger, with commitment)
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getTokenAccountsByOwner",
-        "params": [wallet_address, {"mint": IFC_MINT}, {"encoding": "jsonParsed"}]
+        "params": [
+            wallet_address,
+            {"mint": IFC_MINT},
+            {"encoding": "jsonParsed", "commitment": "confirmed"}
+        ]
     }
-    endpoints = [SOLANA_RPC, "https://solana-rpc.publicnode.com", "https://rpc.ankr.com/solana"]
+    endpoints = [
+        SOLANA_RPC,
+        "https://api.mainnet-beta.solana.com",
+        "https://solana-rpc.publicnode.com",
+        "https://rpc.ankr.com/solana",
+        "https://solana-mainnet.rpc.extrnode.com"
+    ]
     for url in endpoints:
         try:
-            resp = requests.post(url, json=payload, timeout=10, headers={"Content-Type": "application/json"})
+            resp = requests.post(url, json=payload, timeout=15,
+                               headers={"Content-Type": "application/json"})
             if resp.status_code == 200:
                 data = resp.json()
                 if 'result' in data and 'value' in data['result']:
                     accounts = data['result']['value']
-                    if accounts:
-                        total = 0
-                        for acc in accounts:
-                            try:
-                                info = acc['account']['data']['parsed']['info']
-                                ui_amount = info['tokenAmount']['uiAmount']
-                                if ui_amount is not None:
-                                    total += float(ui_amount)
-                            except Exception:
-                                pass
-                        logger.info("RPC balance for %s...: %.2f INFINITE", wallet_address[:6], total)
+                    if not accounts:
+                        logger.info("RPC (%s): no token accounts for %s...", url.split('/')[2], wallet_address[:6])
+                        return 0
+                    total = 0
+                    for acc in accounts:
+                        try:
+                            info = acc['account']['data']['parsed']['info']
+                            token_amount = info.get('tokenAmount', {})
+                            ui_amount = token_amount.get('uiAmount')
+                            if ui_amount is not None:
+                                total += float(ui_amount)
+                            else:
+                                amount = int(token_amount.get('amount', 0))
+                                decimals = int(token_amount.get('decimals', 9))
+                                total += amount / (10 ** decimals)
+                        except Exception:
+                            pass
+                    if total > 0:
+                        logger.info("RPC balance (%s) for %s...: %.6f INFINITE", url.split('/')[2], wallet_address[:6], total)
                         return total
-                    return 0
         except Exception as e:
-            logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:60])
+            logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:80])
 
     # Fallback 2: solana_client library
     if escrow_ready and get_associated_token_address:
@@ -435,11 +456,16 @@ def get_wallet_balance(wallet_address):
                 recipient_ata = Pubkey.from_string(str(recipient_ata))
             resp = solana_client.get_token_account_balance(recipient_ata)
             if hasattr(resp, 'value') and resp.value:
-                return float(resp.value.ui_amount or 0)
+                ui_amount = resp.value.ui_amount
+                if ui_amount is not None:
+                    return float(ui_amount)
+                amount = int(resp.value.amount)
+                decimals = resp.value.decimals
+                return amount / (10 ** decimals)
         except Exception as e:
             logger.error("Client fallback failed: %s", e)
 
-    logger.error("All balance methods failed")
+    logger.error("All balance methods failed for %s", wallet_address[:6])
     return 0
 
 def has_minimum_balance(wallet_address):
@@ -961,13 +987,23 @@ def api_get_balance(uid):
         "is_holder": holder
     }
     if wallet:
-        bal = has_minimum_balance(wallet)
-        result.update({
-            "wallet_balance": bal['balance'],
-            "can_claim": True,
-        })
-        logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s", 
-                    uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
+        try:
+            bal = has_minimum_balance(wallet)
+            result.update({
+                "wallet_balance": bal['balance'],
+                "can_claim": True,
+            })
+            logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s",
+                        uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
+        except Exception as e_bal:
+            logger.error("Balance fetch failed in api_get_balance: %s", e_bal)
+            result.update({
+                "wallet_balance": 0,
+                "can_claim": False,
+                "balance_error": True
+            })
+            logger.info("API /api/balance/%s: wallet=%s... BALANCE FETCH FAILED unclaimed=%s daily=%s/%s",
+                        uid, wallet[:6], e['unclaimed'], claimed, cap)
     else:
         logger.info("API /api/balance/%s: NO WALLET unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
     return jsonify(result)
