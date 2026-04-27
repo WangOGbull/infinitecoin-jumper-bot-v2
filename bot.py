@@ -204,11 +204,8 @@ def is_holder(wallet_address):
         if required is None:
             return False
         result = balance >= required
-        # Only cache confirmed results, not API failures
-        if result or balance > 0:
-            _holder_cache[wallet_address] = (result, now)
-        logger.info("Holder check %s...: %.4f / %.0f INFINITE -> %s",
-                    wallet_address[:4], balance, required, result)
+        _holder_cache[wallet_address] = (result, now)
+        logger.info("Holder check %s...: %.2f / %.0f INFINITE -> %s", wallet_address[:4], balance, required, result)
         return result
     except Exception as e:
         logger.error("Holder check error: %s", e)
@@ -964,23 +961,13 @@ def api_get_balance(uid):
         "is_holder": holder
     }
     if wallet:
-        try:
-            bal = has_minimum_balance(wallet)
-            result.update({
-                "wallet_balance": bal['balance'],
-                "can_claim": True,
-            })
-            logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s",
-                        uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
-        except Exception as e_bal:
-            logger.error("Balance fetch failed in api_get_balance: %s", e_bal)
-            result.update({
-                "wallet_balance": 0,
-                "can_claim": False,
-                "balance_error": True
-            })
-            logger.info("API /api/balance/%s: wallet=%s... BALANCE FETCH FAILED unclaimed=%s daily=%s/%s",
-                        uid, wallet[:6], e['unclaimed'], claimed, cap)
+        bal = has_minimum_balance(wallet)
+        result.update({
+            "wallet_balance": bal['balance'],
+            "can_claim": True,
+        })
+        logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s", 
+                    uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
     else:
         logger.info("API /api/balance/%s: NO WALLET unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
     return jsonify(result)
