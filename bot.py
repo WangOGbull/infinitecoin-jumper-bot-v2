@@ -101,13 +101,14 @@ _init_sqlite()
 
 def _save_score_supabase(wallet, distance, username):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("Supabase not configured: URL=%s KEY=%s", bool(SUPABASE_URL), bool(SUPABASE_KEY))
         return
     try:
         headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates"
+            "Prefer": "resolution=merge-duplicates,return=representation"
         }
         payload = {
             "wallet": wallet,
@@ -116,14 +117,17 @@ def _save_score_supabase(wallet, distance, username):
             "last_updated": int(time.time())
         }
         url = f"{SUPABASE_URL}/rest/v1/high_scores"
+        logger.info("Supabase POST to %s", url)
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        logger.info("Supabase save response: HTTP %s body=%s", resp.status_code, resp.text[:200])
         if resp.status_code not in (200, 201):
-            logger.warning("Supabase save score HTTP %s: %s", resp.status_code, resp.text[:100])
+            logger.warning("Supabase save score FAILED HTTP %s: %s", resp.status_code, resp.text[:300])
     except Exception as e:
         logger.error("Supabase save score error: %s", e)
 
 def _get_leaderboard_supabase(limit=10):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("Supabase leaderboard skipped: not configured")
         return []
     try:
         headers = {
@@ -132,12 +136,15 @@ def _get_leaderboard_supabase(limit=10):
             "Accept": "application/json"
         }
         url = f"{SUPABASE_URL}/rest/v1/high_scores?order=best_distance.desc&limit={limit}"
+        logger.info("Supabase GET leaderboard: %s", url)
         resp = requests.get(url, headers=headers, timeout=10)
+        logger.info("Supabase leaderboard response: HTTP %s body=%s", resp.status_code, resp.text[:300])
         if resp.status_code == 200:
             data = resp.json()
+            logger.info("Supabase leaderboard parsed %s rows", len(data))
             return [(r["wallet"], r["best_distance"], r.get("username", "Anonymous")) for r in data]
         else:
-            logger.warning("Supabase leaderboard HTTP %s: %s", resp.status_code, resp.text[:100])
+            logger.warning("Supabase leaderboard FAILED HTTP %s: %s", resp.status_code, resp.text[:300])
             return []
     except Exception as e:
         logger.error("Supabase leaderboard error: %s", e)
@@ -153,7 +160,9 @@ def _get_best_supabase(wallet):
             "Accept": "application/json"
         }
         url = f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&order=best_distance.desc&limit=1"
+        logger.info("Supabase GET best: %s", url)
         resp = requests.get(url, headers=headers, timeout=10)
+        logger.info("Supabase best response: HTTP %s body=%s", resp.status_code, resp.text[:200])
         if resp.status_code == 200:
             data = resp.json()
             if data:
@@ -173,7 +182,9 @@ def _count_players_supabase():
             "Accept": "application/json"
         }
         url = f"{SUPABASE_URL}/rest/v1/high_scores?select=wallet"
+        logger.info("Supabase GET count: %s", url)
         resp = requests.get(url, headers=headers, timeout=10)
+        logger.info("Supabase count response: HTTP %s body=%s", resp.status_code, resp.text[:200])
         if resp.status_code == 200:
             data = resp.json()
             return len(data)
