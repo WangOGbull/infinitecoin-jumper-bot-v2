@@ -109,6 +109,27 @@ def _save_score_supabase(wallet, distance, username):
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        # First check current best score for this wallet
+        check_url = f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&select=best_distance&limit=1"
+        check_resp = requests.get(check_url, headers=headers, timeout=10)
+        current_best = 0
+        if check_resp.status_code == 200:
+            data = check_resp.json()
+            if data and len(data) > 0:
+                current_best = data[0].get("best_distance", 0)
+
+        # Only save if new score is higher
+        if distance <= current_best:
+            logger.info("Score %s not higher than current best %s for %s... skipping", distance, current_best, wallet[:6])
+            return
+
+        # Upsert the new best score
+        post_headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=representation"
         }
         payload = {
@@ -118,8 +139,8 @@ def _save_score_supabase(wallet, distance, username):
             "last_updated": int(time.time())
         }
         url = f"{SUPABASE_URL}/rest/v1/high_scores"
-        logger.info("Supabase POST to %s", url)
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        logger.info("Supabase POST new best: %s -> %s (was %s)", wallet[:6], distance, current_best)
+        resp = requests.post(url, headers=post_headers, json=payload, timeout=10)
         logger.info("Supabase save response: HTTP %s body=%s", resp.status_code, resp.text[:200])
         if resp.status_code not in (200, 201):
             logger.warning("Supabase save score FAILED HTTP %s: %s", resp.status_code, resp.text[:300])
