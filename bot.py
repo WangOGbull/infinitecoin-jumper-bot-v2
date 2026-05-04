@@ -1,5 +1,5 @@
 """
-Infinitecoin Jumper Bot - Holder Model v5 (Fixed Wallet Scan)
+Infinitecoin Jumper Bot - Holder Model v6 (Wallet-Based Daily Cap Fix)
 Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 150K/day total
 Wallet locked 1x forever. Daily claim tracking resets 24h after first claim.
 """
@@ -87,14 +87,17 @@ CORS(app, origins="*", supports_credentials=True)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ========== SQLITE LEADERBOARD ==========
+# ========== SQLITE LEADERBOARD + DAILY CLAIMS ==========
 DB_PATH = os.path.join(DATA_DIR, "leaderboard.db")
 
 def _init_sqlite():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS high_scores (wallet TEXT PRIMARY KEY, best_distance INTEGER NOT NULL, username TEXT, last_updated REAL)")
+    # OLD uid-based table (kept for migration/reference)
     c.execute("CREATE TABLE IF NOT EXISTS daily_claims (uid TEXT PRIMARY KEY, first_claim INTEGER NOT NULL, total INTEGER NOT NULL)")
+    # NEW wallet-based table (THE FIX)
+    c.execute("CREATE TABLE IF NOT EXISTS wallet_daily_claims (wallet TEXT PRIMARY KEY, first_claim INTEGER NOT NULL, total INTEGER NOT NULL)")
     conn.commit()
     conn.close()
 
@@ -111,7 +114,6 @@ def _save_score_supabase(wallet, distance, username):
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        # First check current best score for this wallet
         check_url = f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&select=best_distance&limit=1"
         check_resp = requests.get(check_url, headers=headers, timeout=10)
         current_best = 0
@@ -119,13 +121,9 @@ def _save_score_supabase(wallet, distance, username):
             data = check_resp.json()
             if data and len(data) > 0:
                 current_best = data[0].get("best_distance", 0)
-
-        # Only save if new score is higher
         if distance <= current_best:
             logger.info("Score %s not higher than current best %s for %s... skipping", distance, current_best, wallet[:6])
             return
-
-        # Upsert the new best score
         post_headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -392,9 +390,87 @@ def _setup_solana():
 
 _setup_solana()
 
-# ========== DAILY CLAIM TRACKING ==========
+# ========== WALLET-BASED DAILY CLAIM TRACKING (THE FIX) ==========
+def get_wallet_daily_claimed(wallet):
+    """Get total INFINITE claimed today by this wallet."""
+    if not wallet:
+        return 0, 0, True
+    w = wallet.strip()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT first_claim, total FROM wallet_daily_claims WHERE wallet = ?", (w,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return 0, 0, True
+        first_claim, total = row
+        if first_claim == 0:
+            return 0, 0, True
+        hours_since = (time.time() * 1000 - first_claim) / (1000 * 60 * 60)
+        if hours_since >= 24:
+            return 0, 0, True
+        return total, first_claim, False
+    except Exception as e:
+        logger.error("get_wallet_daily_claimed SQLite error: %s", e)
+        return 0, 0, True
+
+def add_wallet_daily_claimed(wallet, amount):
+    """Add to today's claimed total for this wallet. Resets if 24h passed since first_claim."""
+    if not wallet:
+        return
+    w = wallet.strip()
+    now_ms = int(time.time() * 1000)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT first_claim, total FROM wallet_daily_claims WHERE wallet = ?", (w,))
+        row = c.fetchone()
+
+        if row:
+            first_claim, total = row
+            hours_since = (now_ms - first_claim) / (1000 * 60 * 60)
+            if hours_since >= 24:
+                c.execute("REPLACE INTO wallet_daily_claims (wallet, first_claim, total) VALUES (?, ?, ?)", (w, now_ms, amount))
+            else:
+                c.execute("UPDATE wallet_daily_claims SET total = total + ? WHERE wallet = ?", (amount, w))
+        else:
+            c.execute("INSERT INTO wallet_daily_claims (wallet, first_claim, total) VALUES (?, ?, ?)", (w, now_ms, amount))
+
+        conn.commit()
+        conn.close()
+        logger.info("SQLite wallet daily claim added: wallet=%s... amount=%s", w[:6], amount)
+    except Exception as e:
+        logger.error("add_wallet_daily_claimed SQLite error: %s", e)
+
+def get_daily_cap(wallet_address):
+    if wallet_address and is_holder(wallet_address):
+        return HOLDER_CAP
+    return FREE_CAP
+
+def get_wallet_daily_remaining(wallet):
+    cap = get_daily_cap(wallet)
+    claimed, _, _ = get_wallet_daily_claimed(wallet)
+    return max(0, cap - claimed)
+
+def get_wallet_daily_reset_time(wallet):
+    _, first_claim, _ = get_wallet_daily_claimed(wallet)
+    if first_claim == 0:
+        return 0
+    reset_ms = first_claim + (24 * 60 * 60 * 1000)
+    remaining_ms = reset_ms - int(time.time() * 1000)
+    return max(0, remaining_ms)
+
+def get_wallet_daily_reset_text(wallet):
+    ms = get_wallet_daily_reset_time(wallet)
+    if ms <= 0:
+        return "Resets now"
+    hours = int(ms / (1000 * 60 * 60))
+    mins = int((ms % (1000 * 60 * 60)) / (1000 * 60))
+    return f"{hours}h {mins}m"
+
+# ========== LEGACY UID-BASED FUNCTIONS (kept for reference, NOT used for cap enforcement) ==========
 def get_daily_claimed(uid):
-    """Get total INFINITE claimed today by this user."""
     uid = str(uid)
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -416,7 +492,6 @@ def get_daily_claimed(uid):
         return 0, 0, True
 
 def add_daily_claimed(uid, amount):
-    """Add to today's claimed total. Resets if 24h passed since first_claim."""
     uid = str(uid)
     now_ms = int(time.time() * 1000)
     try:
@@ -429,7 +504,6 @@ def add_daily_claimed(uid, amount):
             first_claim, total = row
             hours_since = (now_ms - first_claim) / (1000 * 60 * 60)
             if hours_since >= 24:
-                # Reset for new day
                 c.execute("REPLACE INTO daily_claims (uid, first_claim, total) VALUES (?, ?, ?)", (uid, now_ms, amount))
             else:
                 c.execute("UPDATE daily_claims SET total = total + ? WHERE uid = ?", (amount, uid))
@@ -441,11 +515,6 @@ def add_daily_claimed(uid, amount):
         logger.info("SQLite daily claim added: uid=%s amount=%s", uid, amount)
     except Exception as e:
         logger.error("add_daily_claimed SQLite error: %s", e)
-
-def get_daily_cap(wallet_address):
-    if wallet_address and is_holder(wallet_address):
-        return HOLDER_CAP
-    return FREE_CAP
 
 def get_daily_remaining(uid, wallet_address):
     cap = get_daily_cap(wallet_address)
@@ -479,7 +548,6 @@ def get_db(user_id):
 
 # ========== SOLANA FUNCTIONS (FIXED WALLET SCAN) ==========
 def get_wallet_balance(wallet_address):
-    """Get INFINITE token balance via Solana RPC (reliable)."""
     if not wallet_address or len(wallet_address) < 32:
         return 0.0
 
@@ -532,7 +600,6 @@ def get_wallet_balance(wallet_address):
         except Exception as e:
             logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:80])
 
-    # Fallback: solana_client direct ATA lookup
     if escrow_ready and get_associated_token_address and solana_client:
         try:
             from solders.pubkey import Pubkey
@@ -552,7 +619,6 @@ def get_wallet_balance(wallet_address):
     return 0.0
 
 def get_treasury_balance():
-    """Check how much INFINITE the treasury ATA holds."""
     if not escrow_ready or not treasury_ata or not solana_client:
         return 0.0
     try:
@@ -577,11 +643,9 @@ def transfer_ifc(recipient, amount):
     if not escrow_ready:
         return {"success": False, "tx": None, "message": "Treasury not ready"}
 
-    # SCAN recipient wallet before sending
     recipient_bal = get_wallet_balance(recipient)
     logger.info("Pre-send scan: recipient %s... has %.4f INFINITE", recipient[:6], recipient_bal)
 
-    # SCAN treasury before sending
     treasury_bal = get_treasury_balance()
     logger.info("Pre-send scan: treasury has %.4f INFINITE", treasury_bal)
     if treasury_bal < amount:
@@ -670,7 +734,7 @@ def transfer_ifc(recipient, amount):
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": None, "message": str(e), "recipient_balance": recipient_bal}
 
-# ========== DAILY COOLDOWN ==========
+# ========== DAILY COOLDOWN (legacy, kept for daily bonus tracking) ==========
 def is_daily_available(uid):
     last = daily_bonus_db.get(str(uid), 0)
     if not last:
@@ -707,8 +771,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet = user_db.get(uid, {}).get("wallet")
     wallet_text = f"`{wallet[:4]}...{wallet[-4:]}`" if wallet else "*Not connected*"
     holder_status = "\U0001F48E HOLDER" if (wallet and is_holder(wallet)) else "\U0001F464 Free"
-    cap = HOLDER_CAP if (wallet and is_holder(wallet)) else FREE_CAP
-    claimed, _, _ = get_daily_claimed(uid)
+    cap = get_daily_cap(wallet)
+    claimed, _, _ = get_wallet_daily_claimed(wallet)  # FIXED: wallet-based
     remaining = max(0, cap - claimed)
     status_lines = [
         "*Infinitecoin Jumper*", "_Collect coins. Avoid viruses. Earn INFINITE._", "",
@@ -773,8 +837,8 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = has_minimum_balance(wallet)
         holder = is_holder(wallet)
         req = get_required_infinite_for_holder()
-        cap = HOLDER_CAP if holder else FREE_CAP
-        claimed, _, _ = get_daily_claimed(uid)
+        cap = get_daily_cap(wallet)
+        claimed, _, _ = get_wallet_daily_claimed(wallet)  # FIXED: wallet-based
         remaining = max(0, cap - claimed)
         lines.append(f"Balance: {bal['balance']:,.2f} INFINITE (${bal['usd_value']:.6f})")
         if holder:
@@ -802,12 +866,12 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No INFINITE to claim. /play to earn!"); return
 
     cap = get_daily_cap(wallet)
-    claimed, _, reset = get_daily_claimed(uid)
+    claimed, _, reset = get_wallet_daily_claimed(wallet)  # FIXED: wallet-based
     remaining = max(0, cap - claimed)
 
     if remaining <= 0:
         req = get_required_infinite_for_holder()
-        reset_text = get_daily_reset_text(uid)
+        reset_text = get_wallet_daily_reset_text(wallet)
         msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today\nResets in: {reset_text}"
         if not is_holder(wallet) and req:
             msg += f"\n\nHold {req:,.0f} INFINITE (0.1 SOL) to unlock 150K/day"
@@ -817,14 +881,13 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if claimable <= 0:
         await update.message.reply_text("Nothing to claim."); return
 
-    # SCAN wallet before sending
     wallet_balance = get_wallet_balance(wallet)
     result = transfer_ifc(wallet, claimable)
 
     if result['success']:
         e['total_claimed'] += claimable
         e['unclaimed'] -= claimable
-        add_daily_claimed(uid, claimable)
+        add_wallet_daily_claimed(wallet, claimable)  # FIXED: wallet-based
         if wallet:
             wallet_daily_db[wallet] = int(time.time() * 1000)
             _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
@@ -856,7 +919,6 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wallet_daily_db[wallet] = int(time.time() * 1000)
         _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
 
-    # Scan before sending
     wallet_balance = get_wallet_balance(wallet) if wallet else 0
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
     if result.get('success'):
@@ -903,7 +965,6 @@ def health():
 
 @app.route("/api/status")
 def api_status():
-    """Return current caps and holder requirement for the game."""
     req = get_required_infinite_for_holder()
     sol_price = get_sol_price()
     return jsonify({
@@ -917,11 +978,10 @@ def api_status():
 
 @app.route("/api/user/<uid>", methods=["GET"])
 def api_get_user(uid):
-    """Return wallet and daily stats for a user by Telegram ID."""
     wallet = user_db.get(str(uid), {}).get("wallet", "")
     _, e, _, _ = get_db(uid)
     cap = get_daily_cap(wallet)
-    claimed, _, _ = get_daily_claimed(uid)
+    claimed, _, _ = get_wallet_daily_claimed(wallet)  # FIXED: wallet-based
     remaining = max(0, cap - claimed)
     result = {
         "telegram_user_id": uid,
@@ -932,7 +992,7 @@ def api_get_user(uid):
         "daily_cap": cap,
         "daily_claimed": claimed,
         "daily_remaining": remaining,
-        "daily_reset_ms": get_daily_reset_time(uid),
+        "daily_reset_ms": get_wallet_daily_reset_time(wallet),
         "is_holder": is_holder(wallet) if wallet else False
     }
     logger.info("API /api/user/%s: wallet=%s...", uid, wallet[:6] if wallet else "none")
@@ -1025,11 +1085,11 @@ def api_claim():
         return jsonify({"success": False, "message": "No IFC to claim"})
 
     cap = get_daily_cap(wallet)
-    claimed, _, reset = get_daily_claimed(uid)
+    claimed, _, reset = get_wallet_daily_claimed(wallet)  # FIXED: wallet-based
     remaining = max(0, cap - claimed)
 
     if remaining <= 0:
-        reset_text = get_daily_reset_text(uid)
+        reset_text = get_wallet_daily_reset_text(wallet)
         req = get_required_infinite_for_holder()
         msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today. Resets in {reset_text}."
         if not is_holder(wallet) and req:
@@ -1042,7 +1102,6 @@ def api_claim():
     if claimable <= 0:
         return jsonify({"success": False, "message": "Nothing to claim"})
 
-    # SCAN wallet before sending
     wallet_balance = get_wallet_balance(wallet)
     logger.info("API /api/claim pre-scan: %s... balance=%.4f", wallet[:6], wallet_balance)
 
@@ -1052,14 +1111,13 @@ def api_claim():
     if result.get('success'):
         e['total_claimed'] += claimable
         e['unclaimed'] -= claimable
-        add_daily_claimed(uid, claimable)
-        # Also track by wallet for extra security
+        add_wallet_daily_claimed(wallet, claimable)  # FIXED: wallet-based
         if wallet:
             wallet_daily_db[wallet] = int(time.time() * 1000)
             _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
         _save_json(EARNINGS_DB_FILE, earnings_db)
         tier = "HOLDER" if is_holder(wallet) else "Free"
-        new_claimed, _, _ = get_daily_claimed(uid)
+        new_claimed, _, _ = get_wallet_daily_claimed(wallet)
         new_remaining = max(0, cap - new_claimed)
         logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s), daily=%s/%s", claimable, tier, new_claimed, cap)
         return jsonify({
@@ -1105,26 +1163,24 @@ def api_daily():
     return jsonify({
         "success": True,
         "tx": result.get("tx", ""),
-        "transferred": result.get("success", False),
+        "transferred": result.get('success', False),
         "wallet_balance": wallet_balance,
         "wallet_scanned": True
     })
 
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
-    # Get wallet from DB or query param (game sends it directly)
     wallet = user_db.get(str(uid), {}).get("wallet", "")
     query_wallet = request.args.get("wallet", "").strip()
     if not wallet and query_wallet and len(query_wallet) >= 32:
         wallet = query_wallet
-        # Auto-save to DB for future requests
         user_db.setdefault(str(uid), {})["wallet"] = wallet
         _save_json(USER_DB_FILE, user_db)
         logger.info("Auto-saved wallet from query param for uid=%s: %s...", uid, wallet[:6])
 
     _, e, _, _ = get_db(uid)
     cap = get_daily_cap(wallet)
-    claimed, _, _ = get_daily_claimed(uid)
+    claimed, _, _ = get_wallet_daily_claimed(wallet)  # FIXED: wallet-based
     remaining = max(0, cap - claimed)
     holder = is_holder(wallet) if wallet else False
     result = {
@@ -1134,7 +1190,7 @@ def api_get_balance(uid):
         "daily_cap": cap,
         "daily_claimed": claimed,
         "daily_remaining": remaining,
-        "daily_reset_ms": get_daily_reset_time(uid),
+        "daily_reset_ms": get_wallet_daily_reset_time(wallet),
         "is_holder": holder
     }
     if wallet:
@@ -1168,11 +1224,9 @@ def api_score():
         logger.warning("API /api/score REJECTED: negative distance")
         return jsonify({"error": "Invalid distance"}), 400
 
-    # Save to Supabase
     logger.info("API /api/score saving to Supabase: %s... -> %s", wallet[:6], distance)
     _save_score_supabase(wallet, distance, username)
 
-    # Also update in-memory for compatibility
     existing = high_scores_db.get(wallet, {"best_distance": 0})
     new_record = False
     if distance > existing.get("best_distance", 0):
