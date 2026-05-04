@@ -734,30 +734,6 @@ def transfer_ifc(recipient, amount):
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": None, "message": str(e), "recipient_balance": recipient_bal}
 
-# ========== DAILY BONUS (WALLET-BASED ONLY) ==========
-def is_wallet_daily_bonus_available(wallet):
-    if not wallet:
-        return True
-    last = wallet_daily_db.get(wallet, 0)
-    if not last:
-        return True
-    hours_since = (time.time() * 1000 - last) / (1000 * 60 * 60)
-    return hours_since >= 24
-
-def get_wallet_daily_bonus_remaining_text(wallet):
-    if not wallet:
-        return "Available now!"
-    last = wallet_daily_db.get(wallet, 0)
-    if not last:
-        return "Available now!"
-    elapsed_ms = time.time() * 1000 - last
-    remaining_ms = (24 * 60 * 60 * 1000) - elapsed_ms
-    if remaining_ms <= 0:
-        return "Available now!"
-    hours = int(remaining_ms / (1000 * 60 * 60))
-    mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
-    return f"{hours}h {mins}m"
-    
 # ========== DAILY COOLDOWN (legacy, kept for daily bonus tracking) ==========
 def is_daily_available(uid):
     last = daily_bonus_db.get(str(uid), 0)
@@ -928,21 +904,15 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-    async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     wallet = get_db(uid)[0].get("wallet")
     e = get_db(uid)[1]
-    
-    # WALLET-FIRST CHECK
-    if wallet and not is_wallet_daily_bonus_available(wallet):
-        remaining = get_wallet_daily_bonus_remaining_text(wallet)
-        await update.message.reply_text(f"Daily bonus already claimed for this wallet.\nNext: {remaining}")
-        return
-    
-    # Backup uid check only if no wallet
-    if not wallet and not is_daily_available(uid):
-        await update.message.reply_text(f"Cooldown. Next: {get_daily_remaining_text(uid)}")
-        return
+    if not is_daily_available(uid):
+        await update.message.reply_text(f"Cooldown. Next: {get_daily_remaining_text(uid)}"); return
+    if wallet and not is_daily_available_by_wallet(wallet):
+        await update.message.reply_text("This wallet already claimed daily bonus today."); return
+
     daily_bonus_db[uid] = int(time.time() * 1000)
     _save_json(DAILY_DB_FILE, daily_bonus_db)
     if wallet:
@@ -1176,18 +1146,11 @@ def api_daily():
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
     logger.info("API /api/daily uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
-    if not uid: 
-        return jsonify({"error": "Missing"}), 400
-    
-    # WALLET-FIRST CHECK
-    if wallet and not is_wallet_daily_bonus_available(wallet):
-        remaining = get_wallet_daily_bonus_remaining_text(wallet)
-        return jsonify({"success": False, "message": f"Wallet already claimed daily bonus today. Next: {remaining}"})
-    
-    # Backup uid check for no-wallet users
-    if not wallet and not is_daily_available(uid):
-        return jsonify({"success": False, "message": "Cooldown"})
-        
+    if not uid: return jsonify({"error": "Missing"}), 400
+    if not is_daily_available(uid): return jsonify({"success": False, "message": "Cooldown"})
+    if wallet and not is_daily_available_by_wallet(wallet):
+        return jsonify({"success": False, "message": "Wallet already claimed daily bonus today"})
+
     daily_bonus_db[uid] = int(time.time() * 1000)
     _save_json(DAILY_DB_FILE, daily_bonus_db)
     if wallet:
@@ -1238,13 +1201,8 @@ def api_get_balance(uid):
         })
         logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s",
                     uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
-        else:
+    else:
         logger.info("API /api/balance/%s: NO WALLET unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
-    
-    if wallet:
-        result["daily_bonus_available"] = is_wallet_daily_bonus_available(wallet)
-        result["daily_bonus_next"] = get_wallet_daily_bonus_remaining_text(wallet)
-    
     return jsonify(result)
 
 # ========== LEADERBOARD ROUTES ==========
