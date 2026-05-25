@@ -700,17 +700,22 @@ def transfer_ifc(recipient, amount):
             ata_exists = acct_info.get('result', {}).get('value') is not None
         instructions = []
         if not ata_exists:
-            if create_associated_token_account_idempotent:
-                create_ix = create_associated_token_account_idempotent(
-                    payer=treasury_kp.pubkey(),
-                    owner=recipient_pk,
-                    mint=mint_pubkey
-                )
-                instructions.append(create_ix)
-                logger.info("ATA creation instruction added for %s...", recipient[:6])
-            else:
-                logger.error("Cannot create ATA: SPL library not available for %s...", recipient[:6])
-                return {"success": False, "tx": None, "message": "Token account creation unavailable. Contact admin.", "recipient_balance": recipient_bal}
+            sys_prog = Pubkey.from_string("11111111111111111111111111111111")
+            # CreateIdempotent instruction for Associated Token Account program = data [1]
+            create_ix = Instruction(
+                program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+                accounts=[
+                    AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),
+                    AccountMeta(pubkey=recipient_ata, is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=recipient_pk, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+                ],
+                data=bytes([1])  # CreateIdempotent discriminator
+            )
+            instructions.append(create_ix)
+            logger.info("ATA creation instruction added for %s...", recipient[:6])
         ix_data = struct.pack("<BQB", 12, amount_raw, 6)
         transfer_ix = Instruction(
             program_id=TOKEN_PROGRAM_ID,
