@@ -700,20 +700,17 @@ def transfer_ifc(recipient, amount):
             ata_exists = acct_info.get('result', {}).get('value') is not None
         instructions = []
         if not ata_exists:
-            sys_prog = Pubkey.from_string("11111111111111111111111111111111")
-            create_ix = Instruction(
-                program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-                accounts=[
-                    AccountMeta(pubkey=treasury_kp.pubkey(), is_signer=True, is_writable=True),
-                    AccountMeta(pubkey=recipient_ata, is_signer=False, is_writable=True),
-                    AccountMeta(pubkey=recipient_pk, is_signer=False, is_writable=False),
-                    AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                    AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
-                    AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                ],
-                data=b""
-            )
-            instructions.append(create_ix)
+            if create_associated_token_account_idempotent:
+                create_ix = create_associated_token_account_idempotent(
+                    payer=treasury_kp.pubkey(),
+                    owner=recipient_pk,
+                    mint=mint_pubkey
+                )
+                instructions.append(create_ix)
+                logger.info("ATA creation instruction added for %s...", recipient[:6])
+            else:
+                logger.error("Cannot create ATA: SPL library not available for %s...", recipient[:6])
+                return {"success": False, "tx": None, "message": "Token account creation unavailable. Contact admin.", "recipient_balance": recipient_bal}
         ix_data = struct.pack("<BQB", 12, amount_raw, 6)
         transfer_ix = Instruction(
             program_id=TOKEN_PROGRAM_ID,
@@ -1148,23 +1145,40 @@ def api_daily():
     wallet_balance = get_wallet_balance(wallet) if wallet else 0
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
     logger.info("API /api/daily transfer: %s", result.get('success'))
-    return jsonify({
-        "success": True,
-        "tx": result.get("tx", ""),
-        "transferred": result.get('success', False),
-        "wallet_balance": wallet_balance,
-        "wallet_scanned": True
-    })
+
+    # RETURN REAL STATUS — never fake success
+    if result.get('success'):
+        return jsonify({
+            "success": True,
+            "tx": result.get("tx", ""),
+            "transferred": True,
+            "wallet_balance": wallet_balance,
+            "wallet_scanned": True
+        })
+    else:
+        return jsonify({
+            "success": False,
+            "message": result.get("message", "Transfer failed. Wallet needs SOL for fees or token account creation."),
+            "tx": result.get("tx", ""),
+            "transferred": False,
+            "wallet_balance": wallet_balance,
+            "wallet_scanned": True
+        })
 
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
-    wallet = user_db.get(str(uid), {}).get("wallet", "")
     query_wallet = request.args.get("wallet", "").strip()
-    if not wallet and query_wallet and len(query_wallet) >= 32:
+    saved_wallet = user_db.get(str(uid), {}).get("wallet", "")
+
+    # TRUST frontend wallet param FIRST — never serve stale saved wallet
+    if query_wallet and len(query_wallet) >= 32:
         wallet = query_wallet
-        user_db.setdefault(str(uid), {})["wallet"] = wallet
-        _save_json(USER_DB_FILE, user_db)
-        logger.info("Auto-saved wallet from query param for uid=%s: %s...", uid, wallet[:6])
+        if saved_wallet != query_wallet:
+            user_db.setdefault(str(uid), {})["wallet"] = query_wallet
+            _save_json(USER_DB_FILE, user_db)
+            logger.info("Updated wallet for uid=%s: %s... (was %s)", uid, query_wallet[:6], saved_wallet[:6] if saved_wallet else "none")
+    else:
+        wallet = saved_wallet
 
     _, e, _, _ = get_db(uid)
     cap = get_daily_cap(wallet)
