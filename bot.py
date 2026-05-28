@@ -1085,17 +1085,23 @@ def api_claim():
         logger.info("API /api/claim rejected: cap reached %s/%s", claimed, cap)
         return jsonify({"success": False, "message": msg, "cap_reached": True, "daily_claimed": claimed, "daily_cap": cap, "resets_in": reset_text})
     claimable = min(e['unclaimed'], remaining)
-    logger.info("API /api/claim claimable=%s (cap=%s claimed=%s remaining=%s)", claimable, cap, claimed, remaining)
-    if claimable <= 0:
+    # Respect frontend-selected amount
+    requested_amount = int(data.get("amount", 0))
+    if requested_amount > 0:
+        amount = min(requested_amount, claimable)
+    else:
+        amount = claimable
+    logger.info("API /api/claim amount=%s (requested=%s claimable=%s cap=%s claimed=%s remaining=%s)", amount, requested_amount, claimable, cap, claimed, remaining)
+    if amount <= 0:
         return jsonify({"success": False, "message": "Nothing to claim"})
     wallet_balance = get_wallet_balance(wallet)
     logger.info("API /api/claim pre-scan: %s... balance=%.4f", wallet[:6], wallet_balance)
-    result = transfer_ifc(wallet, claimable)
+    result = transfer_ifc(wallet, amount)
     logger.info("API /api/claim transfer result: %s", result.get('success'))
     if result.get('success'):
-        e['total_claimed'] += claimable
-        e['unclaimed'] -= claimable
-        add_wallet_daily_claimed(wallet, claimable)
+        e['total_claimed'] += amount
+        e['unclaimed'] -= amount
+        add_wallet_daily_claimed(wallet, amount)
         if wallet:
             wallet_daily_db[wallet] = int(time.time() * 1000)
             _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
@@ -1103,11 +1109,11 @@ def api_claim():
         tier = "HOLDER" if is_holder(wallet) else "Free"
         new_claimed, _, _ = get_wallet_daily_claimed(wallet)
         new_remaining = max(0, cap - new_claimed)
-        logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s), daily=%s/%s", claimable, tier, new_claimed, cap)
+        logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s), daily=%s/%s", amount, tier, new_claimed, cap)
         return jsonify({
             "success": True,
             "tx": result.get("tx"),
-            "amount": claimable,
+            "amount": amount,
             "message": f"{tier}: {result['message']}",
             "wallet_balance": wallet_balance,
             "wallet_scanned": True,
