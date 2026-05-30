@@ -190,6 +190,31 @@ def _get_best_supabase(wallet):
         logger.error("Supabase best error: %s", e)
         return 0
 
+def _count_higher_scores_supabase(score):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+    try:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json"
+        }
+        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?best_distance=gt.{score}&select=count"
+        logger.info("Supabase GET higher count: %s", url)
+        resp = requests.get(url, headers=headers, timeout=10)
+        logger.info("Supabase higher count response: HTTP %s body=%s", resp.status_code, resp.text[:200])
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data[0].get("count", 0)
+            if isinstance(data, dict):
+                return data.get("count", 0)
+            return 0
+        return 0
+    except Exception as e:
+        logger.error("Supabase higher count error: %s", e)
+        return 0
+
 def _count_players_supabase():
     if not SUPABASE_URL or not SUPABASE_KEY:
         return 0
@@ -1274,6 +1299,19 @@ def api_leaderboard():
     total = _count_players_supabase()
     logger.info("API /api/leaderboard: returning %s entries (total: %s)", len(leaderboard), total)
     return jsonify({"leaderboard": leaderboard, "total_players": total})
+
+@app.route("/api/leaderboard/rank", methods=["GET"])
+def api_leaderboard_rank():
+    wallet = request.args.get("wallet", "").strip()
+    if not wallet or len(wallet) < 32:
+        return jsonify({"error": "Invalid wallet"}), 400
+    best = _get_best_supabase(wallet)
+    if best <= 0:
+        return jsonify({"rank": None, "message": "No score recorded"})
+    higher = _count_higher_scores_supabase(best)
+    rank = higher + 1
+    logger.info("API /api/leaderboard/rank: wallet=%s... best=%s higher=%s rank=%s", wallet[:6], best, higher, rank)
+    return jsonify({"rank": rank, "best_distance": best})
 
 @app.route("/api/highscore/<wallet>", methods=["GET"])
 def api_highscore(wallet):
