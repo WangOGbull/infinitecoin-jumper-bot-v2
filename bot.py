@@ -101,7 +101,7 @@ def _init_sqlite():
 
 _init_sqlite()
 
-def _save_score_supabase(wallet, distance, username):
+def _save_score_supabase(wallet, distance, username, uid=None):
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.warning("Supabase not configured: URL=%s KEY=%s", bool(SUPABASE_URL), bool(SUPABASE_KEY))
         return
@@ -119,6 +119,13 @@ def _save_score_supabase(wallet, distance, username):
             data = check_resp.json()
             if data and len(data) > 0:
                 current_best = data[0].get("best_distance", 0)
+                existing_uid = data[0].get("telegram_uid")
+
+        # ANTI-EXPLOIT: Block if wallet linked to DIFFERENT user
+        if uid and existing_uid and str(existing_uid) != str(uid):
+            logger.warning("EXPLOIT BLOCKED: wallet %s... linked to uid=%s, rejecting uid=%s", wallet[:6], existing_uid, uid)
+            return
+
         if distance <= current_best:
             logger.info("Score %s not higher than current best %s for %s... skipping", distance, current_best, wallet[:6])
             return
@@ -132,6 +139,7 @@ def _save_score_supabase(wallet, distance, username):
             "wallet": wallet,
             "best_distance": distance,
             "username": username,
+            "telegram_uid": str(uid) if uid else None,
             "last_updated": int(time.time())
         }
         url = f"{SUPABASE_URL}/rest/v1/high_scores"
@@ -1255,7 +1263,9 @@ def api_score():
     wallet = data.get("wallet_address", "").strip()
     distance = int(data.get("distance", data.get("score", 0)))
     username = data.get("username", "Anonymous")
-    logger.info("API /api/score REQUEST wallet=%s... distance=%s username=%s", wallet[:6] if wallet else "none", distance, username)
+    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
+
+    logger.info("API /api/score REQUEST uid=%s wallet=%s... distance=%s username=%s", uid, wallet[:6] if wallet else "none", distance, username)
     if not wallet:
         logger.warning("API /api/score REJECTED: no wallet")
         return jsonify({"error": "No wallet"}), 400
@@ -1265,8 +1275,24 @@ def api_score():
     if distance < 0:
         logger.warning("API /api/score REJECTED: negative distance")
         return jsonify({"error": "Invalid distance"}), 400
-    logger.info("API /api/score saving to Supabase: %s... -> %s", wallet[:6], distance)
-    _save_score_supabase(wallet, distance, username)
+
+    # ANTI-EXPLOIT: Check if wallet already linked to DIFFERENT user
+    if SUPABASE_URL and SUPABASE_KEY and uid:
+        try:
+            h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Accept": "application/json"}
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&select=telegram_uid&limit=1", headers=h, timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                if d and len(d) > 0:
+                    existing_uid = d[0].get("telegram_uid")
+                    if existing_uid and str(existing_uid) != str(uid):
+                        logger.warning("EXPLOIT BLOCKED: wallet %s... linked to uid=%s, rejecting uid=%s", wallet[:6], existing_uid, uid)
+                        return jsonify({"error": "Wallet already linked to another account", "blocked": True}), 403
+        except Exception as e:
+            logger.error("Exploit check error: %s", e)
+
+    logger.info("API /api/score saving to Supabase: uid=%s wallet=%s... -> %s", uid, wallet[:6], distance)
+    _save_score_supabase(wallet, distance, username, uid)
     existing = high_scores_db.get(wallet, {"best_distance": 0})
     new_record = False
     if distance > existing.get("best_distance", 0):
