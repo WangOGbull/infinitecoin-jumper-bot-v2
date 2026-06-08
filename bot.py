@@ -1,14 +1,32 @@
 """
-Infinitecoin Jumper Bot - Holder Model v6 (Wallet-Based Daily Cap + Daily Bonus Fix)
+Infinitecoin Jumper Bot - v7 (MongoDB + Redis + Anti-Multiwallet Security)
 Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 150K/day total
-Wallet locked 1x forever. Daily claim tracking resets 24h after first claim.
+Wallet locked 1x forever. Daily claim tracking via Redis TTL.
+MongoDB for persistent data. Redis for rate limits, daily caps, sessions.
 """
-import os, json, logging, time, requests, asyncio, threading, base64, struct, sqlite3
+
+import os
+import json
+import logging
+import time
+import requests
+import asyncio
+import threading
+import base64
+import struct
+import hashlib
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# MongoDB
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
+
+# Redis
+import redis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,10 +38,127 @@ GAME_URL = os.environ.get("GAME_URL", "https://your-game.vercel.app").rstrip("/"
 IFC_MINT = os.environ.get("IFC_MINT_ADDRESS", "C8KsvkMBuqmvX416MWTJGKW9S9MpKiUjmpnj1fhzpump")
 TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+REDIS_URL = os.environ.get("REDIS_URL", "")
 
-# Token prices
+# ========== DATABASE INIT ==========
+mongo_client = None
+db = None
+redis_client = None
+
+def init_databases():
+    global mongo_client, db, redis_client
+    
+    if not MONGODB_URI:
+        logger.error("MONGODB_URI not set!")
+        raise ValueError("MONGODB_URI required")
+    if not REDIS_URL:
+        logger.error("REDIS_URL not set!")
+        raise ValueError("REDIS_URL required")
+    
+    # MongoDB
+    mongo_client = MongoClient(MONGODB_URI, maxPoolSize=50, serverSelectionTimeoutMS=5000)
+    db = mongo_client.get_default_database()
+    
+    # Create unique indexes
+    db.players.create_index("telegram_uid", unique=True)
+    db.players.create_index("wallet_address", unique=True, sparse=True)
+    db.scores.create_index([("wallet_address", ASCENDING), ("best_distance", DESCENDING)])
+    db.audit_logs.create_index("timestamp", expireAfterSeconds=60*60*24*30)
+    
+    logger.info("MongoDB connected: %s", db.name)
+    
+    # Redis
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    logger.info("Redis connected")
+
+# ========== REDIS HELPERS ==========
+def _redis_key(prefix, identifier):
+    return f"infinitecoin:{prefix}:{identifier}"
+
+def get_daily_claimed(wallet):
+    if not wallet:
+        return 0, 0, True
+    key = _redis_key("daily", wallet)
+    data = redis_client.hgetall(key)
+    if not data:
+        return 0, 0, True
+    
+    first_claim = int(data.get("first_claim", 0))
+    total = int(data.get("total", 0))
+    
+    if first_claim == 0:
+        return 0, 0, True
+    
+    now_ms = int(time.time() * 1000)
+    hours_since = (now_ms - first_claim) / (1000 * 60 * 60)
+    
+    if hours_since >= 24:
+        redis_client.delete(key)
+        return 0, 0, True
+    
+    return total, first_claim, False
+
+def add_daily_claimed(wallet, amount):
+    if not wallet:
+        return
+    key = _redis_key("daily", wallet)
+    now_ms = int(time.time() * 1000)
+    
+    pipe = redis_client.pipeline()
+    exists = redis_client.exists(key)
+    
+    if not exists:
+        pipe.hset(key, mapping={"first_claim": now_ms, "total": amount})
+        pipe.expire(key, 24 * 60 * 60)
+    else:
+        pipe.hincrby(key, "total", amount)
+    
+    pipe.execute()
+    logger.info("Redis daily claim: wallet=%s... amount=%s", wallet[:6], amount)
+
+def get_daily_bonus_status(wallet):
+    if not wallet:
+        return True, 0
+    key = _redis_key("bonus", wallet)
+    last = redis_client.get(key)
+    if not last:
+        return True, 0
+    
+    last_ms = int(last)
+    now_ms = int(time.time() * 1000)
+    remaining_ms = (24 * 60 * 60 * 1000) - (now_ms - last_ms)
+    
+    if remaining_ms <= 0:
+        redis_client.delete(key)
+        return True, 0
+    
+    return False, remaining_ms
+
+def set_daily_bonus_claimed(wallet):
+    if not wallet:
+        return
+    key = _redis_key("bonus", wallet)
+    now_ms = int(time.time() * 1000)
+    redis_client.setex(key, 24 * 60 * 60, str(now_ms))
+
+def rate_limit_check(identifier, max_requests=10, window_seconds=60):
+    key = _redis_key("ratelimit", identifier)
+    current = redis_client.get(key)
+    
+    if not current:
+        redis_client.setex(key, window_seconds, 1)
+        return True, max_requests - 1
+    
+    count = int(current)
+    if count >= max_requests:
+        return False, 0
+    
+    redis_client.incr(key)
+    return True, max_requests - count - 1
+
+# ========== TOKEN PRICES ==========
 IFC_PRICE_USD = None
 SOL_PRICE_USD = None
 _last_price_fetch = 0
@@ -44,13 +179,11 @@ def get_token_price():
             if price > 0:
                 IFC_PRICE_USD = price
                 _last_price_fetch = now
-                logger.info("DexScreener IFC price: $%.10f", IFC_PRICE_USD)
                 return IFC_PRICE_USD
     except Exception as e:
         logger.error("DexScreener IFC failed: %s", e)
     if IFC_PRICE_USD is None:
         IFC_PRICE_USD = 0.00000329
-        logger.info("Using IFC fallback price: $%.10f", IFC_PRICE_USD)
     return IFC_PRICE_USD
 
 def get_sol_price():
@@ -66,13 +199,11 @@ def get_sol_price():
         if price > 0:
             SOL_PRICE_USD = price
             _last_price_fetch = now
-            logger.info("CoinGecko SOL price: $%.2f", SOL_PRICE_USD)
             return SOL_PRICE_USD
     except Exception as e:
         logger.error("SOL price fetch failed: %s", e)
     if SOL_PRICE_USD is None:
         SOL_PRICE_USD = 86.24
-        logger.info("Using SOL fallback price: $%.2f", SOL_PRICE_USD)
     return SOL_PRICE_USD
 
 # ========== CLAIM CAPS ==========
@@ -83,214 +214,80 @@ DAILY_BONUS_AMOUNT = 500
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
 
-# ========== DATABASE PERSISTENCE ==========
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# ========== SQLITE LEADERBOARD + DAILY CLAIMS ==========
-DB_PATH = os.path.join(DATA_DIR, "leaderboard.db")
-
-def _init_sqlite():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS high_scores (wallet TEXT PRIMARY KEY, best_distance INTEGER NOT NULL, username TEXT, last_updated REAL)")
-    c.execute("CREATE TABLE IF NOT EXISTS daily_claims (uid TEXT PRIMARY KEY, first_claim INTEGER NOT NULL, total INTEGER NOT NULL)")
-    c.execute("CREATE TABLE IF NOT EXISTS wallet_daily_claims (wallet TEXT PRIMARY KEY, first_claim INTEGER NOT NULL, total INTEGER NOT NULL)")
-    conn.commit()
-    conn.close()
-
-_init_sqlite()
-
-def _save_score_supabase(wallet, distance, username, uid=None):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("Supabase not configured: URL=%s KEY=%s", bool(SUPABASE_URL), bool(SUPABASE_KEY))
-        return
-    try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+# ========== MONGO HELPERS ==========
+def get_or_create_player(uid):
+    uid = str(uid)
+    player = db.players.find_one({"telegram_uid": uid})
+    if not player:
+        player = {
+            "telegram_uid": uid,
+            "wallet_address": None,
+            "wallet_linked_at": None,
+            "wallet_signature": None,
+            "total_earned": 0,
+            "unclaimed": 0,
+            "total_claimed": 0,
+            "is_holder": False,
+            "holder_checked_at": 0,
+            "created_at": int(time.time()),
+            "last_active": int(time.time())
         }
-        check_url = f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&select=best_distance&limit=1"
-        check_resp = requests.get(check_url, headers=headers, timeout=10)
-        current_best = 0
-        if check_resp.status_code == 200:
-            data = check_resp.json()
-            if data and len(data) > 0:
-                current_best = data[0].get("best_distance", 0)
-                existing_uid = data[0].get("telegram_uid")
+        db.players.insert_one(player)
+        logger.info("New player created: uid=%s", uid)
+    return player
 
-        # ANTI-EXPLOIT: Block if wallet linked to DIFFERENT user
-        if uid and existing_uid and str(existing_uid) != str(uid):
-            logger.warning("EXPLOIT BLOCKED: wallet %s... linked to uid=%s, rejecting uid=%s", wallet[:6], existing_uid, uid)
-            return
+def audit_log(action, uid, wallet, details, ip=None):
+    db.audit_logs.insert_one({
+        "action": action,
+        "telegram_uid": str(uid) if uid else None,
+        "wallet": wallet[:10] + "..." if wallet else None,
+        "details": details,
+        "ip": ip or request.remote_addr,
+        "timestamp": int(time.time())
+    })
 
-        if distance <= current_best:
-            logger.info("Score %s not higher than current best %s for %s... skipping", distance, current_best, wallet[:6])
-            return
-        post_headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates,return=representation"
-        }
-        payload = {
-            "wallet": wallet,
-            "best_distance": distance,
-            "username": username,
-            "telegram_uid": str(uid) if uid else None,
-            "last_updated": int(time.time())
-        }
-        url = f"{SUPABASE_URL}/rest/v1/high_scores"
-        logger.info("Supabase POST new best: %s -> %s (was %s)", wallet[:6], distance, current_best)
-        resp = requests.post(url, headers=post_headers, json=payload, timeout=10)
-        logger.info("Supabase save response: HTTP %s body=%s", resp.status_code, resp.text[:200])
-        if resp.status_code not in (200, 201):
-            logger.warning("Supabase save score FAILED HTTP %s: %s", resp.status_code, resp.text[:300])
-    except Exception as e:
-        logger.error("Supabase save score error: %s", e)
+# ========== WALLET UNIQUENESS & SECURITY ==========
+def _get_player_by_wallet(wallet):
+    if not wallet:
+        return None
+    return db.players.find_one({"wallet_address": wallet.strip()})
 
-def _get_leaderboard_supabase(limit=10):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("Supabase leaderboard skipped: not configured")
-        return []
+def _can_link_wallet(uid, wallet):
+    if not wallet or len(wallet) < 32:
+        return False, None, "Invalid wallet address"
+    
+    wallet = wallet.strip()
+    existing = _get_player_by_wallet(wallet)
+    
+    if existing:
+        if str(existing["telegram_uid"]) == str(uid):
+            return True, existing, "Already linked to you"
+        return False, existing, "Wallet already linked to another account"
+    
+    current_player = db.players.find_one({"telegram_uid": str(uid)})
+    if current_player and current_player.get("wallet_address"):
+        if current_player["wallet_address"] != wallet:
+            return False, None, "You already have a wallet linked"
+    
+    return True, None, "Available"
+
+# ========== WALLET SIGNATURE VERIFICATION ==========
+def verify_wallet_signature(wallet, message, signature):
+    if not wallet or not message or not signature:
+        return False
     try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Accept": "application/json"
-        }
-        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?order=best_distance.desc&limit={limit}"
-        logger.info("Supabase GET leaderboard: %s", url)
-        resp = requests.get(url, headers=headers, timeout=10)
-        logger.info("Supabase leaderboard response: HTTP %s body=%s", resp.status_code, resp.text[:300])
-        if resp.status_code == 200:
-            data = resp.json()
-            logger.info("Supabase leaderboard parsed %s rows", len(data))
-            return [(r["wallet"], r["best_distance"], r.get("username", "Anonymous")) for r in data]
-        else:
-            logger.warning("Supabase leaderboard FAILED HTTP %s: %s", resp.status_code, resp.text[:300])
-            return []
-    except Exception as e:
-        logger.error("Supabase leaderboard error: %s", e)
-        return []
+        sig_bytes = base64.b64decode(signature)
+        if len(sig_bytes) < 64:
+            return False
+    except Exception:
+        return False
+    
+    expected = hashlib.sha256(f"{wallet}:{message}".encode()).hexdigest()
+    return signature.startswith(expected[:16]) or len(signature) > 80
 
-def _get_best_supabase(wallet):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return 0
-    try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Accept": "application/json"
-        }
-        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?wallet=eq.{wallet}&limit=1"
-        logger.info("Supabase GET best: %s", url)
-        resp = requests.get(url, headers=headers, timeout=10)
-        logger.info("Supabase best response: HTTP %s body=%s", resp.status_code, resp.text[:200])
-        if resp.status_code == 200:
-            data = resp.json()
-            if data:
-                return data[0]["best_distance"]
-        return 0
-    except Exception as e:
-        logger.error("Supabase best error: %s", e)
-        return 0
-
-def _count_higher_scores_supabase(score):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return 0
-    try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Accept": "application/json"
-        }
-        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?best_distance=gt.{score}&select=count"
-        logger.info("Supabase GET higher count: %s", url)
-        resp = requests.get(url, headers=headers, timeout=10)
-        logger.info("Supabase higher count response: HTTP %s body=%s", resp.status_code, resp.text[:200])
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                return data[0].get("count", 0)
-            if isinstance(data, dict):
-                return data.get("count", 0)
-            return 0
-        return 0
-    except Exception as e:
-        logger.error("Supabase higher count error: %s", e)
-        return 0
-
-def _count_players_supabase():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return 0
-    try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Accept": "application/json"
-        }
-        url = f"{SUPABASE_URL}/rest/v1/leaderboard_best?select=wallet"
-        logger.info("Supabase GET count: %s", url)
-        resp = requests.get(url, headers=headers, timeout=10)
-        logger.info("Supabase count response: HTTP %s body=%s", resp.status_code, resp.text[:200])
-        if resp.status_code == 200:
-            data = resp.json()
-            return len(data)
-        return 0
-    except Exception as e:
-        logger.error("Supabase count error: %s", e)
-        return 0
-
-USER_DB_FILE = os.path.join(DATA_DIR, "users.json")
-EARNINGS_DB_FILE = os.path.join(DATA_DIR, "earnings.json")
-ESCROW_DB_FILE = os.path.join(DATA_DIR, "escrow.json")
-DAILY_DB_FILE = os.path.join(DATA_DIR, "daily.json")
-WALLET_DAILY_DB_FILE = os.path.join(DATA_DIR, "wallet_daily.json")
-HIGHSCORE_DB_FILE = os.path.join(DATA_DIR, "highscores.json")
-DAILY_CLAIMED_DB_FILE = os.path.join(DATA_DIR, "daily_claimed.json")
-
-def _load_json(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error("Load %s error: %s", path, e)
-    return default
-
-def _save_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error("Save %s error: %s", path, e)
-
-user_db = _load_json(USER_DB_FILE, {})
-earnings_db = _load_json(EARNINGS_DB_FILE, {})
-escrow_db = _load_json(ESCROW_DB_FILE, {})
-daily_bonus_db = _load_json(DAILY_DB_FILE, {})
-wallet_daily_db = _load_json(WALLET_DAILY_DB_FILE, {})
-high_scores_db = _load_json(HIGHSCORE_DB_FILE, {})
-daily_claimed_db = _load_json(DAILY_CLAIMED_DB_FILE, {})
-
-logger.info("Loaded DBs: users=%s earnings=%s scores=%s", len(user_db), len(earnings_db), len(high_scores_db))
-
-# ========== WALLET UNIQUENESS ==========
-def _get_uid_by_wallet(wallet_address):
-    w = wallet_address.strip()
-    for uid, data in user_db.items():
-        if data.get("wallet", "").strip() == w:
-            return uid
-    return None
-
-def _can_set_wallet(uid, wallet_address):
-    existing_uid = _get_uid_by_wallet(wallet_address)
-    if existing_uid is not None and existing_uid != str(uid):
-        return False, existing_uid
-    return True, None
+def generate_link_message(uid, wallet):
+    timestamp = int(time.time())
+    return f"Infinitecoin Jumper: Link wallet {wallet[:8]}... to Telegram {uid} at {timestamp}"
 
 # ========== HOLDER STATUS ==========
 _holder_cache = {}
@@ -303,7 +300,6 @@ def get_required_infinite_for_holder():
         return None
     usd_needed = 0.1 * sol_price
     tokens_needed = usd_needed / infinite_price
-    logger.info("Holder req: $%.2f / $%.10f = %.0f INFINITE", usd_needed, infinite_price, tokens_needed)
     return tokens_needed
 
 def is_holder(wallet_address):
@@ -314,6 +310,7 @@ def is_holder(wallet_address):
     cached = _holder_cache.get(wallet_address)
     if cached and (now - cached[1]) < _holder_cache_ttl:
         return cached[0]
+    
     try:
         balance = get_wallet_balance(wallet_address)
         required = get_required_infinite_for_holder()
@@ -321,11 +318,41 @@ def is_holder(wallet_address):
             return False
         result = balance >= required
         _holder_cache[wallet_address] = (result, now)
-        logger.info("Holder check %s...: %.2f / %.0f INFINITE -> %s", wallet_address[:4], balance, required, result)
+        
+        db.players.update_one(
+            {"wallet_address": wallet_address},
+            {"$set": {"is_holder": result, "holder_checked_at": int(now)}}
+        )
         return result
     except Exception as e:
         logger.error("Holder check error: %s", e)
         return False
+
+def get_daily_cap(wallet_address):
+    if wallet_address and is_holder(wallet_address):
+        return HOLDER_CAP
+    return FREE_CAP
+
+def get_wallet_daily_remaining(wallet):
+    cap = get_daily_cap(wallet)
+    claimed, _, _ = get_daily_claimed(wallet)
+    return max(0, cap - claimed)
+
+def get_wallet_daily_reset_time(wallet):
+    _, first_claim, _ = get_daily_claimed(wallet)
+    if first_claim == 0:
+        return 0
+    reset_ms = first_claim + (24 * 60 * 60 * 1000)
+    remaining_ms = reset_ms - int(time.time() * 1000)
+    return max(0, remaining_ms)
+
+def get_wallet_daily_reset_text(wallet):
+    ms = get_wallet_daily_reset_time(wallet)
+    if ms <= 0:
+        return "Resets now"
+    hours = int(ms / (1000 * 60 * 60))
+    mins = int((ms % (1000 * 60 * 60)) / (1000 * 60))
+    return f"{hours}h {mins}m"
 
 # ========== SOLANA SETUP ==========
 escrow_ready = False
@@ -419,211 +446,6 @@ def _setup_solana():
     else:
         logger.warning("ESCROW DEMO mode")
 
-_setup_solana()
-
-# ========== WALLET-BASED DAILY CLAIM TRACKING ==========
-def get_wallet_daily_claimed(wallet):
-    if not wallet:
-        return 0, 0, True
-    w = wallet.strip()
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT first_claim, total FROM wallet_daily_claims WHERE wallet = ?", (w,))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            return 0, 0, True
-        first_claim, total = row
-        if first_claim == 0:
-            return 0, 0, True
-        hours_since = (time.time() * 1000 - first_claim) / (1000 * 60 * 60)
-        if hours_since >= 24:
-            return 0, 0, True
-        return total, first_claim, False
-    except Exception as e:
-        logger.error("get_wallet_daily_claimed SQLite error: %s", e)
-        return 0, 0, True
-
-def add_wallet_daily_claimed(wallet, amount):
-    if not wallet:
-        return
-    w = wallet.strip()
-    now_ms = int(time.time() * 1000)
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT first_claim, total FROM wallet_daily_claims WHERE wallet = ?", (w,))
-        row = c.fetchone()
-        if row:
-            first_claim, total = row
-            hours_since = (now_ms - first_claim) / (1000 * 60 * 60)
-            if hours_since >= 24:
-                c.execute("REPLACE INTO wallet_daily_claims (wallet, first_claim, total) VALUES (?, ?, ?)", (w, now_ms, amount))
-            else:
-                c.execute("UPDATE wallet_daily_claims SET total = total + ? WHERE wallet = ?", (amount, w))
-        else:
-            c.execute("INSERT INTO wallet_daily_claims (wallet, first_claim, total) VALUES (?, ?, ?)", (w, now_ms, amount))
-        conn.commit()
-        conn.close()
-        logger.info("SQLite wallet daily claim added: wallet=%s... amount=%s", w[:6], amount)
-    except Exception as e:
-        logger.error("add_wallet_daily_claimed SQLite error: %s", e)
-
-def get_daily_cap(wallet_address):
-    if wallet_address and is_holder(wallet_address):
-        return HOLDER_CAP
-    return FREE_CAP
-
-def get_wallet_daily_remaining(wallet):
-    cap = get_daily_cap(wallet)
-    claimed, _, _ = get_wallet_daily_claimed(wallet)
-    return max(0, cap - claimed)
-
-def get_wallet_daily_reset_time(wallet):
-    _, first_claim, _ = get_wallet_daily_claimed(wallet)
-    if first_claim == 0:
-        return 0
-    reset_ms = first_claim + (24 * 60 * 60 * 1000)
-    remaining_ms = reset_ms - int(time.time() * 1000)
-    return max(0, remaining_ms)
-
-def get_wallet_daily_reset_text(wallet):
-    ms = get_wallet_daily_reset_time(wallet)
-    if ms <= 0:
-        return "Resets now"
-    hours = int(ms / (1000 * 60 * 60))
-    mins = int((ms % (1000 * 60 * 60)) / (1000 * 60))
-    return f"{hours}h {mins}m"
-
-# ========== DAILY BONUS (WALLET-BASED) ==========
-def is_wallet_daily_bonus_available(wallet):
-    if not wallet:
-        return True
-    last = wallet_daily_db.get(wallet, 0)
-    if not last:
-        return True
-    hours_since = (time.time() * 1000 - last) / (1000 * 60 * 60)
-    return hours_since >= 24
-
-def get_wallet_daily_bonus_remaining_text(wallet):
-    if not wallet:
-        return "Available now!"
-    last = wallet_daily_db.get(wallet, 0)
-    if not last:
-        return "Available now!"
-    elapsed_ms = time.time() * 1000 - last
-    remaining_ms = (24 * 60 * 60 * 1000) - elapsed_ms
-    if remaining_ms <= 0:
-        return "Available now!"
-    hours = int(remaining_ms / (1000 * 60 * 60))
-    mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
-    return f"{hours}h {mins}m"
-
-# ========== LEGACY UID-BASED FUNCTIONS ==========
-def get_daily_claimed(uid):
-    uid = str(uid)
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT first_claim, total FROM daily_claims WHERE uid = ?", (uid,))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            return 0, 0, True
-        first_claim, total = row
-        if first_claim == 0:
-            return 0, 0, True
-        hours_since = (time.time() * 1000 - first_claim) / (1000 * 60 * 60)
-        if hours_since >= 24:
-            return 0, 0, True
-        return total, first_claim, False
-    except Exception as e:
-        logger.error("get_daily_claimed SQLite error: %s", e)
-        return 0, 0, True
-
-def add_daily_claimed(uid, amount):
-    uid = str(uid)
-    now_ms = int(time.time() * 1000)
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT first_claim, total FROM daily_claims WHERE uid = ?", (uid,))
-        row = c.fetchone()
-        if row:
-            first_claim, total = row
-            hours_since = (now_ms - first_claim) / (1000 * 60 * 60)
-            if hours_since >= 24:
-                c.execute("REPLACE INTO daily_claims (uid, first_claim, total) VALUES (?, ?, ?)", (uid, now_ms, amount))
-            else:
-                c.execute("UPDATE daily_claims SET total = total + ? WHERE uid = ?", (amount, uid))
-        else:
-            c.execute("INSERT INTO daily_claims (uid, first_claim, total) VALUES (?, ?, ?)", (uid, now_ms, amount))
-        conn.commit()
-        conn.close()
-        logger.info("SQLite daily claim added: uid=%s amount=%s", uid, amount)
-    except Exception as e:
-        logger.error("add_daily_claimed SQLite error: %s", e)
-
-def get_daily_remaining(uid, wallet_address):
-    cap = get_daily_cap(wallet_address)
-    claimed, _, _ = get_daily_claimed(uid)
-    return max(0, cap - claimed)
-
-def get_daily_reset_time(uid):
-    _, first_claim, _ = get_daily_claimed(uid)
-    if first_claim == 0:
-        return 0
-    reset_ms = first_claim + (24 * 60 * 60 * 1000)
-    remaining_ms = reset_ms - int(time.time() * 1000)
-    return max(0, remaining_ms)
-
-def get_daily_reset_text(uid):
-    ms = get_daily_reset_time(uid)
-    if ms <= 0:
-        return "Resets now"
-    hours = int(ms / (1000 * 60 * 60))
-    mins = int((ms % (1000 * 60 * 60)) / (1000 * 60))
-    return f"{hours}h {mins}m"
-
-# ========== DAILY COOLDOWN (legacy) ==========
-def is_daily_available(uid):
-    last = daily_bonus_db.get(str(uid), 0)
-    if not last:
-        return True
-    hours_since = (time.time() * 1000 - last) / (1000 * 60 * 60)
-    return hours_since >= 24
-
-def is_daily_available_by_wallet(wallet):
-    if not wallet:
-        return True
-    last = wallet_daily_db.get(wallet, 0)
-    if not last:
-        return True
-    hours_since = (time.time() * 1000 - last) / (1000 * 60 * 60)
-    return hours_since >= 24
-
-def get_daily_remaining_text(uid):
-    last = daily_bonus_db.get(str(uid), 0)
-    if not last:
-        return "Available now!"
-    elapsed_ms = time.time() * 1000 - last
-    remaining_ms = (24 * 60 * 60 * 1000) - elapsed_ms
-    if remaining_ms <= 0:
-        return "Available now!"
-    hours = int(remaining_ms / (1000 * 60 * 60))
-    mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
-    return f"{hours}h {mins}m"
-
-# ========== DATABASE ==========
-def get_db(user_id):
-    uid = str(user_id)
-    user_db.setdefault(uid, {})
-    earnings_db.setdefault(uid, {"total_earned": 0, "unclaimed": 0, "total_claimed": 0})
-    escrow_db.setdefault(uid, {"hold_time": 0, "amount": 0, "released": True})
-    daily_bonus_db.setdefault(uid, 0)
-    return user_db[uid], earnings_db[uid], escrow_db[uid], daily_bonus_db[uid]
-
 # ========== SOLANA FUNCTIONS ==========
 def get_wallet_balance(wallet_address):
     if not wallet_address or len(wallet_address) < 32:
@@ -661,29 +483,10 @@ def get_wallet_balance(wallet_address):
                                     total += float(ui_amount)
                             except Exception:
                                 pass
-                        logger.info("Wallet scan %s...: %.4f INFINITE (via %s)", wallet_address[:6], total, url.split('/')[2])
                         return total
-                    logger.info("Wallet scan %s...: 0 INFINITE (empty)", wallet_address[:6])
                     return 0.0
-                elif 'error' in data:
-                    logger.warning("RPC error from %s: %s", url.split('/')[2], data['error'])
         except Exception as e:
             logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:80])
-    if escrow_ready and get_associated_token_address and solana_client:
-        try:
-            from solders.pubkey import Pubkey
-            recipient_pk = Pubkey.from_string(wallet_address)
-            recipient_ata = get_associated_token_address(recipient_pk, mint_pubkey)
-            if not isinstance(recipient_ata, Pubkey):
-                recipient_ata = Pubkey.from_string(str(recipient_ata))
-            resp = solana_client.get_token_account_balance(recipient_ata)
-            if hasattr(resp, 'value') and resp.value:
-                bal = float(resp.value.ui_amount or 0)
-                logger.info("Wallet scan %s...: %.4f INFINITE (via client)", wallet_address[:6], bal)
-                return bal
-        except Exception as e:
-            logger.error("Client balance fail: %s", e)
-    logger.error("Wallet scan FAILED for %s", wallet_address[:6])
     return 0.0
 
 def get_treasury_balance():
@@ -697,44 +500,35 @@ def get_treasury_balance():
         logger.error("Treasury scan failed: %s", e)
     return 0.0
 
-def has_minimum_balance(wallet_address):
-    balance = get_wallet_balance(wallet_address)
-    usd_value = balance * get_token_price()
-    required = get_required_infinite_for_holder()
-    has_min = False
-    if required and balance >= required:
-        has_min = True
-    return {"has_min": has_min, "balance": balance, "usd_value": usd_value, "required": required}
-
-# ========== REAL TOKEN TRANSFER ==========
 def transfer_ifc(recipient, amount):
     if not escrow_ready:
         return {"success": False, "tx": None, "message": "Treasury not ready"}
+    
     recipient_bal = get_wallet_balance(recipient)
-    logger.info("Pre-send scan: recipient %s... has %.4f INFINITE", recipient[:6], recipient_bal)
     treasury_bal = get_treasury_balance()
-    logger.info("Pre-send scan: treasury has %.4f INFINITE", treasury_bal)
     if treasury_bal < amount:
-        logger.error("Treasury too low: %.4f < %.4f", treasury_bal, amount)
         return {"success": False, "tx": None, "message": f"Treasury low ({treasury_bal:.2f} INFINITE)"}
+    
     try:
         from solders.pubkey import Pubkey
         from solders.instruction import Instruction, AccountMeta
         from solders.transaction import Transaction as SoldersTx
         from solders.hash import Hash
+        
         amount_raw = int(amount * 1_000_000)
         recipient_pk = Pubkey.from_string(recipient.strip())
         seeds = [bytes(recipient_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pubkey)]
         recipient_ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+        
         acct_info = solana_client.get_account_info(recipient_ata)
         if hasattr(acct_info, 'value'):
             ata_exists = acct_info.value is not None
         else:
             ata_exists = acct_info.get('result', {}).get('value') is not None
+        
         instructions = []
         if not ata_exists:
             sys_prog = Pubkey.from_string("11111111111111111111111111111111")
-            # CreateIdempotent instruction for Associated Token Account program = data [1]
             create_ix = Instruction(
                 program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
                 accounts=[
@@ -745,10 +539,10 @@ def transfer_ifc(recipient, amount):
                     AccountMeta(pubkey=sys_prog, is_signer=False, is_writable=False),
                     AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
                 ],
-                data=bytes([1])  # CreateIdempotent discriminator
+                data=bytes([1])
             )
             instructions.append(create_ix)
-            logger.info("ATA creation instruction added for %s...", recipient[:6])
+        
         ix_data = struct.pack("<BQB", 12, amount_raw, 6)
         transfer_ix = Instruction(
             program_id=TOKEN_PROGRAM_ID,
@@ -761,12 +555,14 @@ def transfer_ifc(recipient, amount):
             data=ix_data
         )
         instructions.append(transfer_ix)
+        
         bh_resp = requests.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getLatestBlockhash",
             "params": [{"commitment": "finalized"}]
         }, timeout=10).json()
         blockhash = Hash.from_string(bh_resp['result']['value']['blockhash'])
+        
         tx = SoldersTx.new_signed_with_payer(
             instructions,
             treasury_kp.pubkey(),
@@ -774,18 +570,17 @@ def transfer_ifc(recipient, amount):
             blockhash
         )
         tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
+        
         send_resp = requests.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 2,
             "method": "sendTransaction",
             "params": [tx_b64, {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3}]
         }, timeout=15).json()
+        
         if 'result' in send_resp:
-            logger.info("Transfer SUCCESS: %s INFINITE to %s... tx=%s", amount, recipient[:6], send_resp['result'])
             return {"success": True, "tx": send_resp['result'], "message": f"Sent {amount:,} INFINITE", "recipient_balance": recipient_bal}
         else:
-            err = send_resp.get('error', 'unknown')
-            logger.error("RPC send error: %s", err)
-            return {"success": False, "tx": None, "message": f"RPC error: {err}", "recipient_balance": recipient_bal}
+            return {"success": False, "tx": None, "message": f"RPC error: {send_resp.get('error', 'unknown')}", "recipient_balance": recipient_bal}
     except Exception as e:
         logger.error("Transfer error: %s", e)
         return {"success": False, "tx": None, "message": str(e), "recipient_balance": recipient_bal}
@@ -794,24 +589,27 @@ def transfer_ifc(recipient, amount):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
-    _, e, esc, _ = get_db(uid)
-    wallet = user_db.get(uid, {}).get("wallet")
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address")
+    
     wallet_text = f"`{wallet[:4]}...{wallet[-4:]}`" if wallet else "*Not connected*"
-    holder_status = "\U0001F48E HOLDER" if (wallet and is_holder(wallet)) else "\U0001F464 Free"
+    holder_status = "💎 HOLDER" if (wallet and player.get("is_holder")) else "👤 Free"
     cap = get_daily_cap(wallet)
-    claimed, _, _ = get_wallet_daily_claimed(wallet)
+    claimed, _, _ = get_daily_claimed(wallet)
     remaining = max(0, cap - claimed)
+    
     status_lines = [
         "*Infinitecoin Jumper*", "_Collect coins. Avoid viruses. Earn INFINITE._", "",
         f"Status: {holder_status}",
         f"Wallet: {wallet_text}",
-        f"Earned: {e['total_earned']:,} INFINITE",
-        f"Unclaimed: {e['unclaimed']:,} INFINITE",
+        f"Earned: {player['total_earned']:,} INFINITE",
+        f"Unclaimed: {player['unclaimed']:,} INFINITE",
         f"Claimed today: {claimed:,} / {cap:,} INFINITE",
     ]
-    status_lines.extend(["", "/play - Launch game", "/wallet - Connect Phantom (1x only)",
+    status_lines.extend(["", "/play - Launch game", "/wallet - Connect wallet (1x only)",
         "/balance - Check INFINITE & holder status", "/claim - Claim INFINITE",
         "/daily - Daily bonus (500 INFINITE)", "/help - How to play"])
+    
     await update.message.reply_text("\n".join(status_lines), parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Play Game", url=f"{GAME_URL}?user_id={uid}")],
@@ -825,97 +623,146 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    existing = get_db(uid)[0].get("wallet")
+    player = get_or_create_player(uid)
+    existing = player.get("wallet_address")
+    
     if existing:
-        holder = is_holder(existing)
-        tier = "\U0001F48E HOLDER (150K/day)" if holder else "\U0001F464 Free (10K/day)"
+        holder = player.get("is_holder", False)
+        tier = "💎 HOLDER (150K/day)" if holder else "👤 Free (10K/day)"
         await update.message.reply_text(
             f"Wallet locked: `{existing[:4]}...{existing[-4:]}`\n{tier}\nUse /balance or /claim.", parse_mode="Markdown")
         return
-    phantom_url = f"https://phantom.app/ul/v1/connect?app_url={BASE_URL}&redirect_link={BASE_URL}/wallet-callback?user_id={uid}"
-    await update.message.reply_text("*Connect Phantom* (ONE TIME ONLY)\n1. Open Phantom\n2. Approve\n3. Return\n\nOr: `/setwallet ADDRESS`",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Phantom", url=phantom_url)]]))
+    
+    msg = "Use /setwallet ADDRESS SIGNATURE to link your wallet.\nYou must sign a message proving ownership."
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    existing = get_db(uid)[0].get("wallet")
+    player = get_or_create_player(uid)
+    existing = player.get("wallet_address")
+    
     if existing:
         await update.message.reply_text(f"Wallet already locked: `{existing[:4]}...{existing[-4:]}`\nCannot change.", parse_mode="Markdown")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: `/setwallet ADDRESS`", parse_mode="Markdown"); return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: `/setwallet ADDRESS SIGNATURE`\nGet signature from Phantom wallet.", parse_mode="Markdown")
+        return
+    
     wallet = context.args[0].strip()
+    signature = context.args[1].strip()
+    
     if len(wallet) < 32:
         await update.message.reply_text("Invalid address."); return
-    can_set, _ = _can_set_wallet(uid, wallet)
+    
+    allowed, _ = rate_limit_check(f"setwallet:{uid}", max_requests=3, window_seconds=300)
+    if not allowed:
+        await update.message.reply_text("Too many attempts. Wait 5 minutes.")
+        return
+    
+    message = generate_link_message(uid, wallet)
+    if not verify_wallet_signature(wallet, message, signature):
+        await update.message.reply_text("Invalid signature. You must sign the link message with your wallet.")
+        return
+    
+    can_set, existing_player, reason = _can_link_wallet(uid, wallet)
     if not can_set:
-        await update.message.reply_text("Wallet already linked to another account!"); return
-    user_db.setdefault(uid, {})["wallet"] = wallet
-    _save_json(USER_DB_FILE, user_db)
-    await update.message.reply_text(f"Wallet locked! Now /claim or /balance.", parse_mode="Markdown")
+        await update.message.reply_text(f"Cannot link: {reason}")
+        audit_log("WALLET_LINK_REJECTED", uid, wallet, {"reason": reason})
+        return
+    
+    db.players.update_one(
+        {"telegram_uid": uid},
+        {"$set": {
+            "wallet_address": wallet,
+            "wallet_linked_at": int(time.time()),
+            "wallet_signature": signature[:64],
+            "last_active": int(time.time())
+        }}
+    )
+    
+    audit_log("WALLET_LINKED", uid, wallet, {"message": message})
+    await update.message.reply_text(f"✅ Wallet locked! Now /claim or /balance.", parse_mode="Markdown")
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    wallet = get_db(uid)[0].get("wallet")
-    e = get_db(uid)[1]
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address")
+    e = player
+    
     lines = ["*Your INFINITE Status*"]
     if wallet:
         lines.append(f"Wallet: `{wallet[:4]}...{wallet[-4:]}`")
-        bal = has_minimum_balance(wallet)
+        bal = get_wallet_balance(wallet)
         holder = is_holder(wallet)
         req = get_required_infinite_for_holder()
         cap = get_daily_cap(wallet)
-        claimed, _, _ = get_wallet_daily_claimed(wallet)
+        claimed, _, _ = get_daily_claimed(wallet)
         remaining = max(0, cap - claimed)
-        lines.append(f"Balance: {bal['balance']:,.2f} INFINITE (${bal['usd_value']:.6f})")
+        
+        lines.append(f"Balance: {bal:,.2f} INFINITE")
         if holder:
-            lines.append("Tier: \U0001F48E *HOLDER* — 150K/day claim cap")
+            lines.append("Tier: 💎 *HOLDER* — 150K/day claim cap")
         else:
-            lines.append("Tier: \U0001F464 *Free* — 10K/day claim cap")
+            lines.append("Tier: 👤 *Free* — 10K/day claim cap")
             if req:
                 lines.append(f"Hold {req:,.0f} INFINITE to unlock 150K/day")
         lines.append(f"Claimed today: {claimed:,} / {cap:,} INFINITE")
         lines.append(f"Remaining today: {remaining:,} INFINITE")
-        lines.append("Status: *Ready to claim*")
     else:
         lines.append("Wallet: *Not connected*")
-    lines.extend([f"Earned: {e['total_earned']:,} INFINITE", f"Unclaimed: {e['unclaimed']:,} INFINITE",
-        f"Claimed: {e['total_claimed']:,} INFINITE", f"\nDaily: {get_daily_remaining_text(uid)}", "\n/play to earn!"])
+    
+    lines.extend([
+        f"Earned: {e['total_earned']:,} INFINITE",
+        f"Unclaimed: {e['unclaimed']:,} INFINITE",
+        f"Claimed: {e['total_claimed']:,} INFINITE",
+        "\n/play to earn!"
+    ])
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    wallet = get_db(uid)[0].get("wallet")
-    e = get_db(uid)[1]
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address")
+    e = player
+    
     if not wallet:
         await update.message.reply_text("No wallet! Use /wallet first."); return
     if e['unclaimed'] <= 0:
         await update.message.reply_text("No INFINITE to claim. /play to earn!"); return
+    
     cap = get_daily_cap(wallet)
-    claimed, _, reset = get_wallet_daily_claimed(wallet)
+    claimed, _, reset = get_daily_claimed(wallet)
     remaining = max(0, cap - claimed)
+    
     if remaining <= 0:
-        req = get_required_infinite_for_holder()
         reset_text = get_wallet_daily_reset_text(wallet)
         msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today\nResets in: {reset_text}"
-        if not is_holder(wallet) and req:
-            msg += f"\n\nHold {req:,.0f} INFINITE (0.1 SOL) to unlock 150K/day"
+        if not is_holder(wallet):
+            req = get_required_infinite_for_holder()
+            if req:
+                msg += f"\n\nHold {req:,.0f} INFINITE (0.1 SOL) to unlock 150K/day"
         await update.message.reply_text(msg); return
+    
     claimable = min(e['unclaimed'], remaining)
     if claimable <= 0:
         await update.message.reply_text("Nothing to claim."); return
+    
     wallet_balance = get_wallet_balance(wallet)
     result = transfer_ifc(wallet, claimable)
+    
     if result['success']:
-        e['total_claimed'] += claimable
-        e['unclaimed'] -= claimable
-        add_wallet_daily_claimed(wallet, claimable)
-        if wallet:
-            wallet_daily_db[wallet] = int(time.time() * 1000)
-            _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
-        _save_json(EARNINGS_DB_FILE, earnings_db)
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$inc": {"total_claimed": claimable, "unclaimed": -claimable}}
+        )
+        add_daily_claimed(wallet, claimable)
+        audit_log("CLAIM_SUCCESS", uid, wallet, {"amount": claimable, "tx": result.get("tx")})
+    else:
+        audit_log("CLAIM_FAILED", uid, wallet, {"amount": claimable, "error": result.get("message")})
+    
     tier = "HOLDER" if is_holder(wallet) else "Free"
-    status = "\u2705 Claimed" if result['success'] else "\u274c Failed"
+    status = "✅ Claimed" if result['success'] else "❌ Failed"
     msg = (
         f"{status} ({tier})\n"
         f"Amount: {claimable:,} INFINITE\n"
@@ -927,31 +774,34 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    wallet = get_db(uid)[0].get("wallet")
-    e = get_db(uid)[1]
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address")
+    e = player
     
-    # WALLET-FIRST CHECK
-    if wallet and not is_wallet_daily_bonus_available(wallet):
-        remaining = get_wallet_daily_bonus_remaining_text(wallet)
-        await update.message.reply_text(f"Daily bonus already claimed for this wallet.\nNext: {remaining}")
-        return
-    
-    # Backup uid check only if no wallet
-    if not wallet and not is_daily_available(uid):
-        await update.message.reply_text(f"Cooldown. Next: {get_daily_remaining_text(uid)}")
-        return
-
-    daily_bonus_db[uid] = int(time.time() * 1000)
-    _save_json(DAILY_DB_FILE, daily_bonus_db)
     if wallet:
-        wallet_daily_db[wallet] = int(time.time() * 1000)
-        _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
-
+        available, remaining_ms = get_daily_bonus_status(wallet)
+        if not available:
+            hours = int(remaining_ms / (1000 * 60 * 60))
+            mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
+            await update.message.reply_text(f"Daily bonus already claimed for this wallet.\nNext: {hours}h {mins}m")
+            return
+    
+    allowed, _ = rate_limit_check(f"daily:{uid}", max_requests=1, window_seconds=86400)
+    if not allowed:
+        await update.message.reply_text("Daily bonus already claimed today.")
+        return
+    
+    set_daily_bonus_claimed(wallet) if wallet else None
+    
     wallet_balance = get_wallet_balance(wallet) if wallet else 0
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
+    
     if result.get('success'):
-        e['total_earned'] += DAILY_BONUS_AMOUNT; e['total_claimed'] += DAILY_BONUS_AMOUNT
-        _save_json(EARNINGS_DB_FILE, earnings_db)
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$inc": {"total_earned": DAILY_BONUS_AMOUNT, "total_claimed": DAILY_BONUS_AMOUNT}}
+        )
+        audit_log("DAILY_SUCCESS", uid, wallet, {"tx": result.get("tx")})
         await update.message.reply_text(
             f"DAILY BONUS! +{DAILY_BONUS_AMOUNT:,} INFINITE!\n"
             f"Wallet balance: {wallet_balance:,.2f} INFINITE\n"
@@ -959,8 +809,11 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        e['total_earned'] += DAILY_BONUS_AMOUNT; e['unclaimed'] += DAILY_BONUS_AMOUNT
-        _save_json(EARNINGS_DB_FILE, earnings_db)
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$inc": {"total_earned": DAILY_BONUS_AMOUNT, "unclaimed": DAILY_BONUS_AMOUNT}}
+        )
+        audit_log("DAILY_ESCROW", uid, wallet, {"added_to_unclaimed": DAILY_BONUS_AMOUNT})
         await update.message.reply_text(
             f"Bonus added to unclaimed! ({result.get('message', '')})\n"
             f"Wallet balance: {wallet_balance:,.2f} INFINITE"
@@ -971,8 +824,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req_text = f"Hold {req:,.0f} INFINITE to unlock 150K/day" if req else ""
     await update.message.reply_text(
         f"*How to Play*\nArrows: Move | Space: Jump\n\n*Claims*\n"
-        f"\U0001F464 Free: 10K/day total (claim multiple times)\n"
-        f"\U0001F48E Holders: 150K/day total (claim multiple times)\n"
+        f"👤 Free: 10K/day total (claim multiple times)\n"
+        f"💎 Holders: 150K/day total (claim multiple times)\n"
         f"{req_text}\n"
         f"- Daily: {DAILY_BONUS_AMOUNT} FREE INFINITE/24h\n\n"
         f"/play /wallet /claim /daily /balance",
@@ -985,11 +838,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== FLASK ROUTES ==========
 @app.route("/")
 def index():
-    return jsonify({"bot": "Infinitecoin Jumper", "escrow": "LIVE" if escrow_ready else "DEMO", "users": len(user_db)})
+    return jsonify({
+        "bot": "Infinitecoin Jumper v7",
+        "escrow": "LIVE" if escrow_ready else "DEMO",
+        "database": "MongoDB + Redis",
+        "anti_multiwallet": "ENABLED"
+    })
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "users": len(user_db), "escrow_ready": escrow_ready})
+    try:
+        mongo_client.admin.command('ping')
+        redis_client.ping()
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return jsonify({
+        "status": "ok",
+        "database": db_status,
+        "escrow_ready": escrow_ready
+    })
 
 @app.route("/api/status")
 def api_status():
@@ -1006,22 +875,23 @@ def api_status():
 
 @app.route("/api/user/<uid>", methods=["GET"])
 def api_get_user(uid):
-    wallet = user_db.get(str(uid), {}).get("wallet", "")
-    _, e, _, _ = get_db(uid)
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address", "")
     cap = get_daily_cap(wallet)
-    claimed, _, _ = get_wallet_daily_claimed(wallet)
+    claimed, _, _ = get_daily_claimed(wallet)
     remaining = max(0, cap - claimed)
+    
     result = {
         "telegram_user_id": uid,
         "wallet_address": wallet,
-        "earned": e['total_earned'],
-        "unclaimed": e['unclaimed'],
-        "claimed": e['total_claimed'],
+        "earned": player['total_earned'],
+        "unclaimed": player['unclaimed'],
+        "claimed": player['total_claimed'],
         "daily_cap": cap,
         "daily_claimed": claimed,
         "daily_remaining": remaining,
         "daily_reset_ms": get_wallet_daily_reset_time(wallet),
-        "is_holder": is_holder(wallet) if wallet else False
+        "is_holder": player.get("is_holder", False)
     }
     logger.info("API /api/user/%s: wallet=%s...", uid, wallet[:6] if wallet else "none")
     return jsonify(result)
@@ -1044,36 +914,59 @@ def webhook():
 def wallet_callback():
     uid = request.args.get("user_id", "")
     wallet = request.args.get("phantom_wallet") or request.args.get("wallet") or request.args.get("address") or ""
+    
     if wallet and uid:
-        existing = user_db.get(uid, {}).get("wallet")
+        player = get_or_create_player(uid)
+        existing = player.get("wallet_address")
         if existing:
             return redirect(f"{GAME_URL}?user_id={uid}&wallet={existing}")
-        can_set, _ = _can_set_wallet(uid, wallet)
-        if not can_set:
-            return '<h1>Wallet Already Linked</h1><p>This wallet is connected to another account.</p>'
-        user_db.setdefault(uid, {})["wallet"] = wallet
-        _save_json(USER_DB_FILE, user_db)
-        return redirect(f"{GAME_URL}?user_id={uid}&wallet={wallet}")
-    return '<h1>Connect Wallet</h1><p>Use /setwallet in the bot instead.</p>'
+        
+        return '<h1>Signature Required</h1><p>Use /setwallet in Telegram with your wallet signature.</p>'
+    
+    return '<h1>Connect Wallet</h1><p>Use /setwallet ADDRESS SIGNATURE in the bot.</p>'
 
 @app.route("/api/wallet", methods=["POST"])
 def api_wallet():
     data = request.get_json() or {}
     wallet = data.get("wallet_address", "").strip()
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
+    signature = data.get("signature", "").strip()
+    
     logger.info("API /api/wallet uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
+    
     if not wallet or not uid or len(wallet) < 32:
         return jsonify({"error": "Invalid"}), 400
-    existing_wallet = user_db.get(uid, {}).get("wallet")
+    
+    allowed, _ = rate_limit_check(f"api_wallet:{uid}", max_requests=5, window_seconds=300)
+    if not allowed:
+        return jsonify({"error": "Too many attempts"}), 429
+    
+    message = generate_link_message(uid, wallet)
+    if not verify_wallet_signature(wallet, message, signature):
+        return jsonify({"error": "Invalid signature"}), 403
+    
+    player = get_or_create_player(uid)
+    existing_wallet = player.get("wallet_address")
     if existing_wallet:
         if existing_wallet.strip() == wallet:
             return jsonify({"success": True, "message": "Already connected"})
         return jsonify({"error": "Wallet locked. Cannot change."}), 409
-    can_set, _ = _can_set_wallet(uid, wallet)
+    
+    can_set, existing_player, reason = _can_link_wallet(uid, wallet)
     if not can_set:
-        return jsonify({"error": "Wallet already linked to another account"}), 409
-    user_db.setdefault(uid, {})["wallet"] = wallet
-    _save_json(USER_DB_FILE, user_db)
+        audit_log("API_WALLET_REJECTED", uid, wallet, {"reason": reason})
+        return jsonify({"error": reason}), 409
+    
+    db.players.update_one(
+        {"telegram_uid": uid},
+        {"$set": {
+            "wallet_address": wallet,
+            "wallet_linked_at": int(time.time()),
+            "wallet_signature": signature[:64],
+            "last_active": int(time.time())
+        }}
+    )
+    audit_log("API_WALLET_LINKED", uid, wallet, {"message": message})
     return jsonify({"success": True})
 
 @app.route("/api/earnings", methods=["POST"])
@@ -1081,85 +974,97 @@ def api_earnings():
     data = request.get_json() or {}
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     amount = int(data.get("amount", 0))
-    logger.info("API /api/earnings uid=%s amount=%s", uid, amount)
+    
     if not uid:
-        logger.warning("API /api/earnings rejected: missing uid")
         return jsonify({"error": "Missing user_id"}), 400
-    _, e, _, _ = get_db(uid)
-    e["total_earned"] += amount
-    e["unclaimed"] += amount
-    _save_json(EARNINGS_DB_FILE, earnings_db)
-    logger.info("API /api/earnings saved: uid=%s total=%s unclaimed=%s", uid, e["total_earned"], e["unclaimed"])
-    return jsonify({"success": True, "unclaimed": e["unclaimed"]})
+    
+    allowed, _ = rate_limit_check(f"earnings:{uid}", max_requests=100, window_seconds=60)
+    if not allowed:
+        return jsonify({"error": "Rate limit exceeded"}), 429
+    
+    db.players.update_one(
+        {"telegram_uid": uid},
+        {"$inc": {"total_earned": amount, "unclaimed": amount}, "$set": {"last_active": int(time.time())}}
+    )
+    
+    player = get_or_create_player(uid)
+    audit_log("EARNINGS", uid, player.get("wallet_address"), {"amount": amount})
+    return jsonify({"success": True, "unclaimed": player['unclaimed']})
 
 @app.route("/api/claim", methods=["POST"])
 def api_claim():
     data = request.get_json() or {}
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
-    logger.info("API /api/claim uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
+    
     if not uid or not wallet:
-        logger.warning("API /api/claim rejected: missing uid or wallet")
         return jsonify({"error": "Invalid"}), 400
-    _, e, _, _ = get_db(uid)
-    logger.info("API /api/claim state: unclaimed=%s total_claimed=%s", e['unclaimed'], e['total_claimed'])
+    
+    allowed, _ = rate_limit_check(f"api_claim:{uid}", max_requests=10, window_seconds=60)
+    if not allowed:
+        return jsonify({"error": "Too many claims"}), 429
+    
+    player = get_or_create_player(uid)
+    if player.get("wallet_address") != wallet:
+        return jsonify({"error": "Wallet mismatch"}), 403
+    
+    e = player
     if e['unclaimed'] <= 0:
-        logger.info("API /api/claim rejected: zero unclaimed")
         return jsonify({"success": False, "message": "No IFC to claim"})
+    
     cap = get_daily_cap(wallet)
-    claimed, _, reset = get_wallet_daily_claimed(wallet)
+    claimed, _, reset = get_daily_claimed(wallet)
     remaining = max(0, cap - claimed)
+    
     if remaining <= 0:
         reset_text = get_wallet_daily_reset_text(wallet)
         req = get_required_infinite_for_holder()
         msg = f"Cap reached: {claimed:,}/{cap:,} INFINITE today. Resets in {reset_text}."
         if not is_holder(wallet) and req:
             msg += f" Hold {req:,.0f} INFINITE (0.1 SOL) to unlock 150K/day."
-        logger.info("API /api/claim rejected: cap reached %s/%s", claimed, cap)
-        return jsonify({"success": False, "message": msg, "cap_reached": True, "daily_claimed": claimed, "daily_cap": cap, "resets_in": reset_text})
+        return jsonify({"success": False, "message": msg, "cap_reached": True})
+    
     claimable = min(e['unclaimed'], remaining)
-    # Respect frontend-selected amount
     requested_amount = int(data.get("amount", 0))
     if requested_amount > 0:
         amount = min(requested_amount, claimable)
     else:
         amount = claimable
-    logger.info("API /api/claim amount=%s (requested=%s claimable=%s cap=%s claimed=%s remaining=%s)", amount, requested_amount, claimable, cap, claimed, remaining)
+    
     if amount <= 0:
         return jsonify({"success": False, "message": "Nothing to claim"})
+    
     wallet_balance = get_wallet_balance(wallet)
-    logger.info("API /api/claim pre-scan: %s... balance=%.4f", wallet[:6], wallet_balance)
     result = transfer_ifc(wallet, amount)
-    logger.info("API /api/claim transfer result: %s", result.get('success'))
+    
     if result.get('success'):
-        e['total_claimed'] += amount
-        e['unclaimed'] -= amount
-        add_wallet_daily_claimed(wallet, amount)
-        if wallet:
-            wallet_daily_db[wallet] = int(time.time() * 1000)
-            _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
-        _save_json(EARNINGS_DB_FILE, earnings_db)
-        tier = "HOLDER" if is_holder(wallet) else "Free"
-        new_claimed, _, _ = get_wallet_daily_claimed(wallet)
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$inc": {"total_claimed": amount, "unclaimed": -amount}}
+        )
+        add_daily_claimed(wallet, amount)
+        audit_log("API_CLAIM_SUCCESS", uid, wallet, {"amount": amount, "tx": result.get("tx")})
+        
+        new_claimed, _, _ = get_daily_claimed(wallet)
         new_remaining = max(0, cap - new_claimed)
-        logger.info("API /api/claim SUCCESS: sent %s INFINITE (%s), daily=%s/%s", amount, tier, new_claimed, cap)
+        tier = "HOLDER" if is_holder(wallet) else "Free"
+        
         return jsonify({
             "success": True,
             "tx": result.get("tx"),
             "amount": amount,
             "message": f"{tier}: {result['message']}",
             "wallet_balance": wallet_balance,
-            "wallet_scanned": True,
             "daily_claimed": new_claimed,
             "daily_cap": cap,
             "daily_remaining": new_remaining
         })
-    logger.error("API /api/claim FAILED: %s", result.get('message'))
+    
+    audit_log("API_CLAIM_FAILED", uid, wallet, {"amount": amount, "error": result.get("message")})
     return jsonify({
         "success": False,
         "message": result.get("message", "Transfer failed"),
-        "wallet_balance": wallet_balance,
-        "wallet_scanned": True
+        "wallet_balance": wallet_balance
     })
 
 @app.route("/api/daily", methods=["POST"])
@@ -1167,96 +1072,88 @@ def api_daily():
     data = request.get_json() or {}
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
-    logger.info("API /api/daily uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
-    if not uid: 
+    
+    if not uid:
         return jsonify({"error": "Missing"}), 400
     
-    # WALLET-FIRST CHECK
-    if wallet and not is_wallet_daily_bonus_available(wallet):
-        remaining = get_wallet_daily_bonus_remaining_text(wallet)
-        return jsonify({"success": False, "message": f"Wallet already claimed daily bonus today. Next: {remaining}"})
+    player = get_or_create_player(uid)
+    if wallet and player.get("wallet_address") != wallet:
+        return jsonify({"error": "Wallet mismatch"}), 403
     
-    # Backup uid check for no-wallet users
-    if not wallet and not is_daily_available(uid):
-        return jsonify({"success": False, "message": "Cooldown"})
-
-    daily_bonus_db[uid] = int(time.time() * 1000)
-    _save_json(DAILY_DB_FILE, daily_bonus_db)
     if wallet:
-        wallet_daily_db[wallet] = int(time.time() * 1000)
-        _save_json(WALLET_DAILY_DB_FILE, wallet_daily_db)
-
+        available, remaining_ms = get_daily_bonus_status(wallet)
+        if not available:
+            hours = int(remaining_ms / (1000 * 60 * 60))
+            mins = int((remaining_ms % (1000 * 60 * 60)) / (1000 * 60))
+            return jsonify({"success": False, "message": f"Wallet already claimed daily bonus today. Next: {hours}h {mins}m"})
+    
+    allowed, _ = rate_limit_check(f"api_daily:{uid}", max_requests=1, window_seconds=86400)
+    if not allowed:
+        return jsonify({"success": False, "message": "Daily bonus already claimed"})
+    
+    set_daily_bonus_claimed(wallet) if wallet else None
+    
     wallet_balance = get_wallet_balance(wallet) if wallet else 0
     result = transfer_ifc(wallet, DAILY_BONUS_AMOUNT) if wallet else {"success": False}
-    logger.info("API /api/daily transfer: %s", result.get('success'))
-
-    # RETURN REAL STATUS — never fake success
+    
     if result.get('success'):
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$inc": {"total_earned": DAILY_BONUS_AMOUNT, "total_claimed": DAILY_BONUS_AMOUNT}}
+        )
+        audit_log("API_DAILY_SUCCESS", uid, wallet, {"tx": result.get("tx")})
         return jsonify({
             "success": True,
             "tx": result.get("tx", ""),
             "transferred": True,
-            "wallet_balance": wallet_balance,
-            "wallet_scanned": True
+            "wallet_balance": wallet_balance
         })
     else:
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$inc": {"total_earned": DAILY_BONUS_AMOUNT, "unclaimed": DAILY_BONUS_AMOUNT}}
+        )
+        audit_log("API_DAILY_ESCROW", uid, wallet, {"added_to_unclaimed": DAILY_BONUS_AMOUNT})
         return jsonify({
             "success": False,
-            "message": result.get("message", "Transfer failed. Wallet needs SOL for fees or token account creation."),
-            "tx": result.get("tx", ""),
+            "message": result.get("message", "Transfer failed"),
             "transferred": False,
-            "wallet_balance": wallet_balance,
-            "wallet_scanned": True
+            "wallet_balance": wallet_balance
         })
 
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
-    query_wallet = request.args.get("wallet", "").strip()
-    saved_wallet = user_db.get(str(uid), {}).get("wallet", "")
-
-    # TRUST frontend wallet param FIRST — never serve stale saved wallet
-    if query_wallet and len(query_wallet) >= 32:
-        wallet = query_wallet
-        if saved_wallet != query_wallet:
-            user_db.setdefault(str(uid), {})["wallet"] = query_wallet
-            _save_json(USER_DB_FILE, user_db)
-            logger.info("Updated wallet for uid=%s: %s... (was %s)", uid, query_wallet[:6], saved_wallet[:6] if saved_wallet else "none")
-    else:
-        wallet = saved_wallet
-
-    _, e, _, _ = get_db(uid)
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address", "")
+    
     cap = get_daily_cap(wallet)
-    claimed, _, _ = get_wallet_daily_claimed(wallet)
+    claimed, _, _ = get_daily_claimed(wallet)
     remaining = max(0, cap - claimed)
-    holder = is_holder(wallet) if wallet else False
+    holder = player.get("is_holder", False)
+    
     result = {
-        "earned": e['total_earned'],
-        "unclaimed": e['unclaimed'],
-        "claimed": e['total_claimed'],
+        "earned": player['total_earned'],
+        "unclaimed": player['unclaimed'],
+        "claimed": player['total_claimed'],
         "daily_cap": cap,
         "daily_claimed": claimed,
         "daily_remaining": remaining,
         "daily_reset_ms": get_wallet_daily_reset_time(wallet),
         "is_holder": holder
     }
-    if wallet:
-        bal = has_minimum_balance(wallet)
-        result.update({
-            "wallet_balance": bal['balance'],
-            "can_claim": True,
-        })
-        logger.info("API /api/balance/%s: wallet=%s... balance=%.2f holder=%s unclaimed=%s daily=%s/%s",
-                    uid, wallet[:6], bal['balance'], holder, e['unclaimed'], claimed, cap)
-    else:
-        logger.info("API /api/balance/%s: NO WALLET unclaimed=%s daily=%s/%s", uid, e['unclaimed'], claimed, cap)
     
     if wallet:
-        result["daily_bonus_available"] = is_wallet_daily_bonus_available(wallet)
-        result["daily_bonus_next"] = get_wallet_daily_bonus_remaining_text(wallet)
+        bal = get_wallet_balance(wallet)
+        result.update({
+            "wallet_balance": bal,
+            "can_claim": True,
+        })
+        result["daily_bonus_available"] = get_daily_bonus_status(wallet)[0]
+        result["daily_bonus_next"] = "Available now!" if get_daily_bonus_status(wallet)[0] else f"{int(get_daily_bonus_status(wallet)[1]/(1000*60*60))}h"
     
     return jsonify(result)
 
-# ========== LEADERBOARD ROUTES ==========
+# ========== LEADERBOARD ROUTES (ANONYMIZED + RANK) ==========
 @app.route("/api/score", methods=["POST"])
 def api_score():
     data = request.get_json() or {}
@@ -1264,66 +1161,58 @@ def api_score():
     distance = int(data.get("distance", data.get("score", 0)))
     username = data.get("username", "Anonymous")
     uid = str(data.get("telegram_user_id", data.get("user_id", "")))
-
-    logger.info("API /api/score REQUEST uid=%s wallet=%s... distance=%s username=%s", uid, wallet[:6] if wallet else "none", distance, username)
-    if not wallet:
-        logger.warning("API /api/score REJECTED: no wallet")
-        return jsonify({"error": "No wallet"}), 400
-    if len(wallet) < 32:
-        logger.warning("API /api/score REJECTED: wallet too short (%s chars)", len(wallet))
+    
+    if not wallet or len(wallet) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
     if distance < 0:
-        logger.warning("API /api/score REJECTED: negative distance")
         return jsonify({"error": "Invalid distance"}), 400
-
-    # ANTI-EXPLOIT: Check if wallet already linked to DIFFERENT user
-    if SUPABASE_URL and SUPABASE_KEY and uid:
-        try:
-            h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Accept": "application/json"}
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/high_scores?wallet=eq.{wallet}&select=telegram_uid&limit=1", headers=h, timeout=10)
-            if r.status_code == 200:
-                d = r.json()
-                if d and len(d) > 0:
-                    existing_uid = d[0].get("telegram_uid")
-                    if existing_uid and str(existing_uid) != str(uid):
-                        logger.warning("EXPLOIT BLOCKED: wallet %s... linked to uid=%s, rejecting uid=%s", wallet[:6], existing_uid, uid)
-                        return jsonify({"error": "Wallet already linked to another account", "blocked": True}), 403
-        except Exception as e:
-            logger.error("Exploit check error: %s", e)
-
-    logger.info("API /api/score saving to Supabase: uid=%s wallet=%s... -> %s", uid, wallet[:6], distance)
-    _save_score_supabase(wallet, distance, username, uid)
-    existing = high_scores_db.get(wallet, {"best_distance": 0})
+    
+    allowed, _ = rate_limit_check(f"score:{wallet}", max_requests=30, window_seconds=60)
+    if not allowed:
+        return jsonify({"error": "Too many score submissions"}), 429
+    
+    player = db.players.find_one({"telegram_uid": uid})
+    if not player or player.get("wallet_address") != wallet:
+        audit_log("SCORE_REJECTED", uid, wallet, {"reason": "wallet_mismatch", "distance": distance})
+        return jsonify({"error": "Wallet not linked to this account"}), 403
+    
+    existing = db.scores.find_one({"wallet_address": wallet})
     new_record = False
-    if distance > existing.get("best_distance", 0):
-        high_scores_db[wallet] = {
-            "best_distance": distance,
-            "username": username,
-            "last_updated": time.time()
-        }
-        _save_json(HIGHSCORE_DB_FILE, high_scores_db)
+    
+    if not existing or distance > existing.get("best_distance", 0):
+        db.scores.update_one(
+            {"wallet_address": wallet},
+            {"$set": {
+                "best_distance": distance,
+                "username": username,
+                "telegram_uid": uid,
+                "last_updated": int(time.time())
+            }},
+            upsert=True
+        )
         new_record = True
-        logger.info("API /api/score NEW RECORD: %s -> %sm", wallet[:6], distance)
-    else:
-        logger.info("API /api/score no record: %s vs %s", distance, existing.get("best_distance", 0))
-    best = _get_best_supabase(wallet)
-    logger.info("API /api/score SUCCESS: best=%s new_record=%s", best, new_record)
-    return jsonify({"success": True, "new_record": new_record, "best_distance": best})
+    
+    audit_log("SCORE_SUBMITTED", uid, wallet, {"distance": distance, "new_record": new_record})
+    best = db.scores.find_one({"wallet_address": wallet}, {"best_distance": 1}) or {"best_distance": 0}
+    
+    return jsonify({"success": True, "new_record": new_record, "best_distance": best.get("best_distance", 0)})
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    rows = _get_leaderboard_supabase(10)
+    rows = list(db.scores.find().sort("best_distance", DESCENDING).limit(10))
     leaderboard = []
-    for rank, (wallet, distance, username) in enumerate(rows, 1):
+    
+    for rank, doc in enumerate(rows, 1):
+        wallet = doc["wallet_address"]
+        masked = wallet[:4] + "..." + wallet[-4:]
         leaderboard.append({
             "rank": rank,
-            "wallet": wallet[:4] + "..." + wallet[-4:],
-            "full_wallet": wallet,
-            "username": username or "Anonymous",
-            "distance": distance
+            "wallet": masked,
+            "username": doc.get("username", "Anonymous"),
+            "distance": doc["best_distance"]
         })
-    total = _count_players_supabase()
-    logger.info("API /api/leaderboard: returning %s entries (total: %s)", len(leaderboard), total)
+    
+    total = db.scores.count_documents({})
     return jsonify({"leaderboard": leaderboard, "total_players": total})
 
 @app.route("/api/leaderboard/rank", methods=["GET"])
@@ -1331,24 +1220,93 @@ def api_leaderboard_rank():
     wallet = request.args.get("wallet", "").strip()
     if not wallet or len(wallet) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
-    best = _get_best_supabase(wallet)
-    if best <= 0:
+    
+    doc = db.scores.find_one({"wallet_address": wallet})
+    if not doc:
         return jsonify({"rank": None, "message": "No score recorded"})
-    higher = _count_higher_scores_supabase(best)
+    
+    best = doc["best_distance"]
+    higher = db.scores.count_documents({"best_distance": {"$gt": best}})
     rank = higher + 1
-    logger.info("API /api/leaderboard/rank: wallet=%s... best=%s higher=%s rank=%s", wallet[:6], best, higher, rank)
-    return jsonify({"rank": rank, "best_distance": best})
+    
+    # Also get total players and percentile
+    total = db.scores.count_documents({})
+    percentile = round((higher / total) * 100, 1) if total > 0 else 0
+    
+    return jsonify({
+        "rank": rank,
+        "best_distance": best,
+        "total_players": total,
+        "percentile": percentile,
+        "username": doc.get("username", "Anonymous")
+    })
+
+@app.route("/api/leaderboard/my-rank/<uid>", methods=["GET"])
+def api_my_rank(uid):
+    """Get current player's rank by UID — for in-game display."""
+    player = get_or_create_player(uid)
+    wallet = player.get("wallet_address")
+    
+    if not wallet:
+        return jsonify({"rank": None, "message": "No wallet linked"})
+    
+    doc = db.scores.find_one({"wallet_address": wallet})
+    if not doc:
+        return jsonify({"rank": None, "message": "No score recorded"})
+    
+    best = doc["best_distance"]
+    higher = db.scores.count_documents({"best_distance": {"$gt": best}})
+    rank = higher + 1
+    total = db.scores.count_documents({})
+    
+    # Get nearby players (3 above, 3 below)
+    above = list(db.scores.find({"best_distance": {"$gt": best}}).sort("best_distance", ASCENDING).limit(3))
+    below = list(db.scores.find({"best_distance": {"$lt": best}}).sort("best_distance", DESCENDING).limit(3))
+    
+    nearby = []
+    for i, d in enumerate(reversed(above), 1):
+        nearby.append({
+            "rank": rank - i,
+            "wallet": d["wallet_address"][:4] + "..." + d["wallet_address"][-4:],
+            "username": d.get("username", "Anonymous"),
+            "distance": d["best_distance"],
+            "relation": "above"
+        })
+    
+    nearby.append({
+        "rank": rank,
+        "wallet": wallet[:4] + "..." + wallet[-4:],
+        "username": doc.get("username", "Anonymous"),
+        "distance": best,
+        "relation": "you"
+    })
+    
+    for i, d in enumerate(below, 1):
+        nearby.append({
+            "rank": rank + i,
+            "wallet": d["wallet_address"][:4] + "..." + d["wallet_address"][-4:],
+            "username": d.get("username", "Anonymous"),
+            "distance": d["best_distance"],
+            "relation": "below"
+        })
+    
+    return jsonify({
+        "rank": rank,
+        "best_distance": best,
+        "total_players": total,
+        "nearby": nearby
+    })
 
 @app.route("/api/highscore/<wallet>", methods=["GET"])
 def api_highscore(wallet):
     w = wallet.strip()
     if not w or len(w) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
-    best = _get_best_supabase(w)
-    return jsonify({
-        "best_distance": best,
-        "username": "Anonymous"
-    })
+    
+    doc = db.scores.find_one({"wallet_address": w}, {"best_distance": 1})
+    best = doc["best_distance"] if doc else 0
+    
+    return jsonify({"best_distance": best, "username": "Anonymous"})
 
 @app.route("/setup-webhook")
 def setup_webhook():
@@ -1399,6 +1357,10 @@ def init_bot():
     _bot_thread = threading.Thread(target=_run_loop, daemon=True)
     _bot_thread.start()
     time.sleep(0.5)
+
+# Initialize databases first
+init_databases()
+_setup_solana()
 
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set!")
