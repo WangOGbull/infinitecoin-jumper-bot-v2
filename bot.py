@@ -72,7 +72,7 @@ def init_databases():
     
     logger.info("MongoDB connected: %s", db.name)
     
-    # Redis — fixed: removed ssl_context parameter
+    # Redis connection - FIXED: removed ssl_context
     parsed = urlparse(REDIS_URL)
     use_ssl = parsed.scheme == "rediss"
     
