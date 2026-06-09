@@ -72,7 +72,7 @@ def init_databases():
     
     logger.info("MongoDB connected: %s", db.name)
     
-    # Redis — explicit constructor (works with redis 4.x and 5.x)
+    # Redis — fixed: removed ssl_context parameter
     parsed = urlparse(REDIS_URL)
     use_ssl = parsed.scheme == "rediss"
     
@@ -91,11 +91,7 @@ def init_databases():
         kwargs["username"] = parsed.username
     
     if use_ssl:
-        ssl_context = ssl.SSLContext()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
         kwargs["ssl"] = True
-        kwargs["ssl_context"] = ssl_context
     
     redis_client = redis.Redis(**kwargs)
     redis_client.ping()
@@ -1422,4 +1418,4 @@ else:
     init_bot()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True
