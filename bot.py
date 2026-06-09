@@ -15,6 +15,8 @@ import threading
 import base64
 import struct
 import hashlib
+import ssl
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -70,12 +72,32 @@ def init_databases():
     
     logger.info("MongoDB connected: %s", db.name)
     
-    # Redis 4.6.0 — stable TLS for Upstash / Railway
-    redis_client = redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        ssl_cert_reqs="none"
-    )
+    # Redis — explicit constructor (works with redis 4.x and 5.x)
+    parsed = urlparse(REDIS_URL)
+    use_ssl = parsed.scheme == "rediss"
+    
+    kwargs = {
+        "host": parsed.hostname,
+        "port": parsed.port or (6380 if use_ssl else 6379),
+        "decode_responses": True,
+        "socket_connect_timeout": 10,
+        "socket_timeout": 10,
+        "health_check_interval": 30,
+    }
+    
+    if parsed.password:
+        kwargs["password"] = parsed.password
+    if parsed.username:
+        kwargs["username"] = parsed.username
+    
+    if use_ssl:
+        ssl_context = ssl.SSLContext()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        kwargs["ssl"] = True
+        kwargs["ssl_context"] = ssl_context
+    
+    redis_client = redis.Redis(**kwargs)
     redis_client.ping()
     logger.info("Redis connected")
 
