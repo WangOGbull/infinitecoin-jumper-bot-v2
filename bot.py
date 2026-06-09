@@ -15,7 +15,7 @@ import threading
 import base64
 import struct
 import hashlib
-import ssl  # FIX 1: Required for Redis TLS
+import ssl
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -42,7 +42,6 @@ SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.c
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 REDIS_URL = os.environ.get("REDIS_URL", "")
 
-# FIX 3: Server-side earnings cap per gameplay run
 MAX_EARNINGS_PER_RUN = 5000
 
 # ========== DATABASE INIT ==========
@@ -72,7 +71,7 @@ def init_databases():
     
     logger.info("MongoDB connected: %s", db.name)
     
-    # FIX 1: Redis — corrected for redis-py 4.x+ (Upstash / Railway TLS)
+    # Redis — Upstash / Railway compatible (SSL + RESP2)
     if REDIS_URL.startswith("rediss://"):
         ssl_context = ssl.SSLContext()
         ssl_context.check_hostname = False
@@ -80,12 +79,14 @@ def init_databases():
         redis_client = redis.from_url(
             REDIS_URL,
             decode_responses=True,
-            ssl_context=ssl_context
+            ssl_context=ssl_context,
+            protocol=2
         )
     else:
         redis_client = redis.from_url(
             REDIS_URL,
-            decode_responses=True
+            decode_responses=True,
+            protocol=2
         )
     
     redis_client.ping()
@@ -289,7 +290,7 @@ def _can_link_wallet(uid, wallet):
     
     return True, None, "Available"
 
-# ========== FIX 2: REAL WALLET SIGNATURE VERIFICATION ==========
+# ========== REAL WALLET SIGNATURE VERIFICATION ==========
 def verify_wallet_signature(wallet, message, signature):
     if not wallet or not message or not signature:
         return False
@@ -305,11 +306,9 @@ def verify_wallet_signature(wallet, message, signature):
         from nacl.exceptions import BadSignatureError
         from solders.pubkey import Pubkey
         
-        # Solana wallet addresses are 32-byte Ed25519 public keys
         pubkey = Pubkey.from_string(wallet)
         verify_key = VerifyKey(bytes(pubkey))
         
-        # Verify Ed25519 signature on the UTF-8 message
         verify_key.verify(message.encode('utf-8'), sig_bytes)
         return True
     except ImportError:
@@ -707,7 +706,6 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         audit_log("WALLET_LINK_REJECTED", uid, wallet, {"reason": reason})
         return
     
-    # FIX 4: Atomic update with race-condition protection
     try:
         db.players.update_one(
             {"telegram_uid": uid},
@@ -999,7 +997,6 @@ def api_wallet():
         audit_log("API_WALLET_REJECTED", uid, wallet, {"reason": reason})
         return jsonify({"error": reason}), 409
     
-    # FIX 4: Atomic update with race-condition protection
     try:
         db.players.update_one(
             {"telegram_uid": uid},
@@ -1026,7 +1023,6 @@ def api_earnings():
     if not uid:
         return jsonify({"error": "Missing user_id"}), 400
     
-    # FIX 3: Server-side earnings cap validation
     if amount <= 0 or amount > MAX_EARNINGS_PER_RUN:
         return jsonify({"error": f"Invalid amount. Max per run: {MAX_EARNINGS_PER_RUN}"}), 400
     
@@ -1281,7 +1277,6 @@ def api_leaderboard_rank():
     higher = db.scores.count_documents({"best_distance": {"$gt": best}})
     rank = higher + 1
     
-    # Also get total players and percentile
     total = db.scores.count_documents({})
     percentile = round((higher / total) * 100, 1) if total > 0 else 0
     
@@ -1295,7 +1290,6 @@ def api_leaderboard_rank():
 
 @app.route("/api/leaderboard/my-rank/<uid>", methods=["GET"])
 def api_my_rank(uid):
-    """Get current player's rank by UID — for in-game display."""
     player = get_or_create_player(uid)
     wallet = player.get("wallet_address")
     
@@ -1311,7 +1305,6 @@ def api_my_rank(uid):
     rank = higher + 1
     total = db.scores.count_documents({})
     
-    # Get nearby players (3 above, 3 below)
     above = list(db.scores.find({"best_distance": {"$gt": best}}).sort("best_distance", ASCENDING).limit(3))
     below = list(db.scores.find({"best_distance": {"$lt": best}}).sort("best_distance", DESCENDING).limit(3))
     
