@@ -1,5 +1,5 @@
 """
-Infinitecoin Jumper Bot - v7 (MongoDB + Redis + Anti-Multiwallet Security)
+Infinitecoin Jumper Bot - v7.1 (MongoDB + Redis + Anti-Multiwallet Security)
 Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 150K/day total
 Wallet locked 1x forever. Daily claim tracking via Redis TTL.
 MongoDB for persistent data. Redis for rate limits, daily caps, sessions.
@@ -15,6 +15,7 @@ import threading
 import base64
 import struct
 import hashlib
+import ssl  # FIX 1: Required for Redis TLS
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -40,6 +41,9 @@ TREASURY_KEY = os.environ.get("TREASURY_PRIVATE_KEY", "")
 SOLANA_RPC = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 REDIS_URL = os.environ.get("REDIS_URL", "")
+
+# FIX 3: Server-side earnings cap per gameplay run
+MAX_EARNINGS_PER_RUN = 5000
 
 # ========== DATABASE INIT ==========
 mongo_client = None
@@ -68,8 +72,22 @@ def init_databases():
     
     logger.info("MongoDB connected: %s", db.name)
     
-    # Redis
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs="none")
+    # FIX 1: Redis — corrected for redis-py 4.x+ (Upstash / Railway TLS)
+    if REDIS_URL.startswith("rediss://"):
+        ssl_context = ssl.SSLContext()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            ssl_context=ssl_context
+        )
+    else:
+        redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True
+        )
+    
     redis_client.ping()
     logger.info("Redis connected")
 
@@ -271,19 +289,37 @@ def _can_link_wallet(uid, wallet):
     
     return True, None, "Available"
 
-# ========== WALLET SIGNATURE VERIFICATION ==========
+# ========== FIX 2: REAL WALLET SIGNATURE VERIFICATION ==========
 def verify_wallet_signature(wallet, message, signature):
     if not wallet or not message or not signature:
         return False
     try:
         sig_bytes = base64.b64decode(signature)
-        if len(sig_bytes) < 64:
+        if len(sig_bytes) != 64:
             return False
     except Exception:
         return False
     
-    expected = hashlib.sha256(f"{wallet}:{message}".encode()).hexdigest()
-    return signature.startswith(expected[:16]) or len(signature) > 80
+    try:
+        from nacl.signing import VerifyKey
+        from nacl.exceptions import BadSignatureError
+        from solders.pubkey import Pubkey
+        
+        # Solana wallet addresses are 32-byte Ed25519 public keys
+        pubkey = Pubkey.from_string(wallet)
+        verify_key = VerifyKey(bytes(pubkey))
+        
+        # Verify Ed25519 signature on the UTF-8 message
+        verify_key.verify(message.encode('utf-8'), sig_bytes)
+        return True
+    except ImportError:
+        logger.error("PyNaCl not installed. Run: pip install pynacl")
+        return False
+    except BadSignatureError:
+        return False
+    except Exception as e:
+        logger.error("Signature verification error: %s", e)
+        return False
 
 def generate_link_message(uid, wallet):
     timestamp = int(time.time())
@@ -671,15 +707,21 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         audit_log("WALLET_LINK_REJECTED", uid, wallet, {"reason": reason})
         return
     
-    db.players.update_one(
-        {"telegram_uid": uid},
-        {"$set": {
-            "wallet_address": wallet,
-            "wallet_linked_at": int(time.time()),
-            "wallet_signature": signature[:64],
-            "last_active": int(time.time())
-        }}
-    )
+    # FIX 4: Atomic update with race-condition protection
+    try:
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$set": {
+                "wallet_address": wallet,
+                "wallet_linked_at": int(time.time()),
+                "wallet_signature": signature[:64],
+                "last_active": int(time.time())
+            }}
+        )
+    except DuplicateKeyError:
+        audit_log("WALLET_LINK_RACE", uid, wallet, {"reason": "DuplicateKeyError"})
+        await update.message.reply_text("Wallet was just linked to another account. Please try a different wallet.")
+        return
     
     audit_log("WALLET_LINKED", uid, wallet, {"message": message})
     await update.message.reply_text(f"✅ Wallet locked! Now /claim or /balance.", parse_mode="Markdown")
@@ -839,7 +881,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @app.route("/")
 def index():
     return jsonify({
-        "bot": "Infinitecoin Jumper v7",
+        "bot": "Infinitecoin Jumper v7.1",
         "escrow": "LIVE" if escrow_ready else "DEMO",
         "database": "MongoDB + Redis",
         "anti_multiwallet": "ENABLED"
@@ -957,15 +999,21 @@ def api_wallet():
         audit_log("API_WALLET_REJECTED", uid, wallet, {"reason": reason})
         return jsonify({"error": reason}), 409
     
-    db.players.update_one(
-        {"telegram_uid": uid},
-        {"$set": {
-            "wallet_address": wallet,
-            "wallet_linked_at": int(time.time()),
-            "wallet_signature": signature[:64],
-            "last_active": int(time.time())
-        }}
-    )
+    # FIX 4: Atomic update with race-condition protection
+    try:
+        db.players.update_one(
+            {"telegram_uid": uid},
+            {"$set": {
+                "wallet_address": wallet,
+                "wallet_linked_at": int(time.time()),
+                "wallet_signature": signature[:64],
+                "last_active": int(time.time())
+            }}
+        )
+    except DuplicateKeyError:
+        audit_log("API_WALLET_RACE", uid, wallet, {"reason": "DuplicateKeyError"})
+        return jsonify({"error": "Wallet already linked to another account"}), 409
+    
     audit_log("API_WALLET_LINKED", uid, wallet, {"message": message})
     return jsonify({"success": True})
 
@@ -977,6 +1025,10 @@ def api_earnings():
     
     if not uid:
         return jsonify({"error": "Missing user_id"}), 400
+    
+    # FIX 3: Server-side earnings cap validation
+    if amount <= 0 or amount > MAX_EARNINGS_PER_RUN:
+        return jsonify({"error": f"Invalid amount. Max per run: {MAX_EARNINGS_PER_RUN}"}), 400
     
     allowed, _ = rate_limit_check(f"earnings:{uid}", max_requests=100, window_seconds=60)
     if not allowed:
