@@ -69,7 +69,7 @@ def init_databases():
     logger.info("MongoDB connected: %s", db.name)
     
     # Redis
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True, ssl=True, ssl_cert_reqs=None)
     redis_client.ping()
     logger.info("Redis connected")
 
