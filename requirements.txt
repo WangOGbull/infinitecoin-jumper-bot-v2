@@ -7,3 +7,4 @@ requests>=2.0
 solders>=0.18.0
 solana>=0.30.0
 gunicorn>=21.0
+pynacl>=1.5.0
