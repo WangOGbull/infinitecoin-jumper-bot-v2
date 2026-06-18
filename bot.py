@@ -1,5 +1,5 @@
 """
-Infinitecoin Jumper Bot - v7.2 (MongoDB + Redis + Anti-Multiwallet Security)
+Infinitecoin Jumper Bot - v7.1 (MongoDB + Redis + Anti-Multiwallet Security)
 Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 150K/day total
 Wallet locked 1x forever. Daily claim tracking via Redis TTL.
 MongoDB for persistent data. Redis for rate limits, daily caps, sessions.
@@ -96,7 +96,7 @@ def init_databases():
     redis_client = redis.Redis(**kwargs)
     redis_client.ping()
     logger.info("Redis connected")
-    
+
     # FIX: Remove duplicate wallet addresses from migration artifacts
     fix_duplicate_wallets()
 
@@ -948,7 +948,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @app.route("/")
 def index():
     return jsonify({
-        "bot": "Infinitecoin Jumper v7.2",
+        "bot": "Infinitecoin Jumper v7.1",
         "escrow": "LIVE" if escrow_ready else "DEMO",
         "database": "MongoDB + Redis",
         "anti_multiwallet": "ENABLED"
@@ -1122,36 +1122,8 @@ def api_claim():
         return jsonify({"error": "Too many claims"}), 429
     
     player = get_or_create_player(uid)
-    player_wallet = player.get("wallet_address")
-    
-    # FIX: If player has no wallet linked, auto-link the provided one if available
-    if not player_wallet:
-        can_set, existing_player, reason = _can_link_wallet(uid, wallet)
-        if can_set:
-            try:
-                db.players.update_one(
-                    {"telegram_uid": uid},
-                    {"$set": {
-                        "wallet_address": wallet,
-                        "wallet_linked_at": int(time.time()),
-                        "last_active": int(time.time())
-                    }}
-                )
-                player = get_or_create_player(uid)  # refresh
-                player_wallet = wallet
-                audit_log("API_CLAIM_AUTO_LINK", uid, wallet, {"reason": "Player had no wallet, auto-linked during claim"})
-            except DuplicateKeyError:
-                return jsonify({"error": "Wallet already linked to another account"}), 409
-        else:
-            return jsonify({"error": f"Cannot link wallet: {reason}"}), 403
-    
-    # Verify wallet matches
-    if player_wallet != wallet:
-        return jsonify({
-            "error": "Wallet mismatch",
-            "expected_wallet": player_wallet[:4] + "..." + player_wallet[-4:] if player_wallet else "None",
-            "message": "This wallet is not linked to your account. Use /wallet in Telegram to check your linked wallet."
-        }), 403
+    if player.get("wallet_address") != wallet:
+        return jsonify({"error": "Wallet mismatch"}), 403
     
     e = player
     if e['unclaimed'] <= 0:
@@ -1316,8 +1288,33 @@ def api_score():
     if not allowed:
         return jsonify({"error": "Too many score submissions"}), 429
     
-    player = db.players.find_one({"telegram_uid": uid})
-    if not player or player.get("wallet_address") != wallet:
+    # FIX: Auto-link wallet if player has no wallet linked yet
+    player = get_or_create_player(uid)
+    player_wallet = player.get("wallet_address")
+
+    if not player_wallet:
+        can_set, existing_player, reason = _can_link_wallet(uid, wallet)
+        if can_set:
+            try:
+                db.players.update_one(
+                    {"telegram_uid": uid},
+                    {"$set": {
+                        "wallet_address": wallet,
+                        "wallet_linked_at": int(time.time()),
+                        "last_active": int(time.time())
+                    }}
+                )
+                player = get_or_create_player(uid)
+                player_wallet = wallet
+                audit_log("SCORE_AUTO_LINK", uid, wallet, {"reason": "Auto-linked during score submission"})
+            except DuplicateKeyError:
+                audit_log("SCORE_LINK_RACE", uid, wallet, {"reason": "DuplicateKeyError"})
+                return jsonify({"error": "Wallet already linked to another account"}), 409
+        else:
+            audit_log("SCORE_REJECTED", uid, wallet, {"reason": reason, "distance": distance})
+            return jsonify({"error": f"Cannot link wallet: {reason}"}), 403
+
+    if player_wallet != wallet:
         audit_log("SCORE_REJECTED", uid, wallet, {"reason": "wallet_mismatch", "distance": distance})
         return jsonify({"error": "Wallet not linked to this account"}), 403
     
@@ -1344,7 +1341,7 @@ def api_score():
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    rows = list(db.scores.find().sort("best_distance", DESCENDING).limit(50))
+    rows = list(db.scores.find().sort("best_distance", DESCENDING).limit(10))
     leaderboard = []
     
     current_rank = 1
@@ -1352,14 +1349,15 @@ def api_leaderboard():
         wallet = doc["wallet_address"]
         masked = wallet[:4] + "..." + wallet[-4:]
         distance = doc["best_distance"]
-        
+
         # Standard competition ranking: same distance = same rank
         if i > 0 and distance != rows[i-1]["best_distance"]:
             current_rank = i + 1
-        
+
         leaderboard.append({
             "rank": current_rank,
             "wallet": masked,
+            "full_wallet": wallet,
             "username": doc.get("username", "Anonymous"),
             "distance": distance
         })
@@ -1462,7 +1460,7 @@ def api_sol_balance():
     wallet = request.args.get("wallet", "").strip()
     if not wallet or len(wallet) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
-    
+
     sol = get_sol_balance(wallet)
     return jsonify({"wallet": wallet, "sol_balance": sol, "lamports": int(sol * 1_000_000_000)})
 
