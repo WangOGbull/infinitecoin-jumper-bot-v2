@@ -1,5 +1,5 @@
 """
-Infinitecoin Jumper Bot - v7.1 (MongoDB + Redis + Anti-Multiwallet Security)
+Infinitecoin Jumper Bot - v7.2 (MongoDB + Redis + Anti-Multiwallet Security)
 Free: 10K/day total | Holders (0.1 SOL worth INFINITE): 150K/day total
 Wallet locked 1x forever. Daily claim tracking via Redis TTL.
 MongoDB for persistent data. Redis for rate limits, daily caps, sessions.
@@ -96,6 +96,39 @@ def init_databases():
     redis_client = redis.Redis(**kwargs)
     redis_client.ping()
     logger.info("Redis connected")
+    
+    # FIX: Remove duplicate wallet addresses from migration artifacts
+    fix_duplicate_wallets()
+
+def fix_duplicate_wallets():
+    """Startup migration: remove duplicate wallet addresses to prevent DuplicateKeyError."""
+    try:
+        pipeline = [
+            {"$match": {"wallet_address": {"$ne": None}}},
+            {"$group": {
+                "_id": "$wallet_address",
+                "count": {"$sum": 1},
+                "docs": {"$push": {"_id": "$_id", "telegram_uid": "$telegram_uid", "wallet_linked_at": "$wallet_linked_at", "created_at": "$created_at"}}
+            }},
+            {"$match": {"count": {"$gt": 1}}}
+        ]
+        duplicates = list(db.players.aggregate(pipeline))
+        fixed = 0
+        for dup in duplicates:
+            docs = dup["docs"]
+            # Keep the one with earliest wallet_linked_at or created_at
+            docs.sort(key=lambda x: x.get("wallet_linked_at") or x.get("created_at", float("inf")))
+            for d in docs[1:]:
+                db.players.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {"wallet_address": None, "wallet_linked_at": None, "wallet_signature": None}}
+                )
+                fixed += 1
+                logger.warning("Fixed duplicate wallet: cleared from uid=%s", d.get("telegram_uid"))
+        if fixed:
+            logger.info("Duplicate wallet migration complete: fixed %s records", fixed)
+    except Exception as e:
+        logger.error("Duplicate wallet migration failed: %s", e)
 
 # ========== REDIS HELPERS ==========
 def _redis_key(prefix, identifier):
@@ -256,7 +289,10 @@ def get_or_create_player(uid):
             "created_at": int(time.time()),
             "last_active": int(time.time())
         }
-        db.players.insert_one(player)
+        try:
+            db.players.insert_one(player)
+        except DuplicateKeyError:
+            player = db.players.find_one({"telegram_uid": uid})
         logger.info("New player created: uid=%s", uid)
     return player
 
@@ -527,6 +563,34 @@ def get_wallet_balance(wallet_address):
                     return 0.0
         except Exception as e:
             logger.warning("RPC fail %s: %s", url.split('/')[2], str(e)[:80])
+    return 0.0
+
+def get_sol_balance(wallet_address):
+    """Get SOL (native) balance for a wallet address."""
+    if not wallet_address or len(wallet_address) < 32:
+        return 0.0
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [wallet_address]
+    }
+    endpoints = [
+        SOLANA_RPC,
+        "https://solana-rpc.publicnode.com",
+        "https://rpc.ankr.com/solana",
+        "https://api.mainnet-beta.solana.com"
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.post(url, json=payload, timeout=10, headers={"Content-Type": "application/json"})
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'result' in data and 'value' in data['result']:
+                    lamports = data['result']['value']
+                    return lamports / 1_000_000_000
+        except Exception as e:
+            logger.warning("SOL balance RPC fail %s: %s", url.split('/')[2], str(e)[:80])
     return 0.0
 
 def get_treasury_balance():
@@ -884,7 +948,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @app.route("/")
 def index():
     return jsonify({
-        "bot": "Infinitecoin Jumper v7.1",
+        "bot": "Infinitecoin Jumper v7.2",
         "escrow": "LIVE" if escrow_ready else "DEMO",
         "database": "MongoDB + Redis",
         "anti_multiwallet": "ENABLED"
@@ -1058,8 +1122,36 @@ def api_claim():
         return jsonify({"error": "Too many claims"}), 429
     
     player = get_or_create_player(uid)
-    if player.get("wallet_address") != wallet:
-        return jsonify({"error": "Wallet mismatch"}), 403
+    player_wallet = player.get("wallet_address")
+    
+    # FIX: If player has no wallet linked, auto-link the provided one if available
+    if not player_wallet:
+        can_set, existing_player, reason = _can_link_wallet(uid, wallet)
+        if can_set:
+            try:
+                db.players.update_one(
+                    {"telegram_uid": uid},
+                    {"$set": {
+                        "wallet_address": wallet,
+                        "wallet_linked_at": int(time.time()),
+                        "last_active": int(time.time())
+                    }}
+                )
+                player = get_or_create_player(uid)  # refresh
+                player_wallet = wallet
+                audit_log("API_CLAIM_AUTO_LINK", uid, wallet, {"reason": "Player had no wallet, auto-linked during claim"})
+            except DuplicateKeyError:
+                return jsonify({"error": "Wallet already linked to another account"}), 409
+        else:
+            return jsonify({"error": f"Cannot link wallet: {reason}"}), 403
+    
+    # Verify wallet matches
+    if player_wallet != wallet:
+        return jsonify({
+            "error": "Wallet mismatch",
+            "expected_wallet": player_wallet[:4] + "..." + player_wallet[-4:] if player_wallet else "None",
+            "message": "This wallet is not linked to your account. Use /wallet in Telegram to check your linked wallet."
+        }), 403
     
     e = player
     if e['unclaimed'] <= 0:
@@ -1252,17 +1344,24 @@ def api_score():
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    rows = list(db.scores.find().sort("best_distance", DESCENDING).limit(10))
+    rows = list(db.scores.find().sort("best_distance", DESCENDING).limit(50))
     leaderboard = []
     
-    for rank, doc in enumerate(rows, 1):
+    current_rank = 1
+    for i, doc in enumerate(rows):
         wallet = doc["wallet_address"]
         masked = wallet[:4] + "..." + wallet[-4:]
+        distance = doc["best_distance"]
+        
+        # Standard competition ranking: same distance = same rank
+        if i > 0 and distance != rows[i-1]["best_distance"]:
+            current_rank = i + 1
+        
         leaderboard.append({
-            "rank": rank,
+            "rank": current_rank,
             "wallet": masked,
             "username": doc.get("username", "Anonymous"),
-            "distance": doc["best_distance"]
+            "distance": distance
         })
     
     total = db.scores.count_documents({})
@@ -1357,6 +1456,15 @@ def api_highscore(wallet):
     best = doc["best_distance"] if doc else 0
     
     return jsonify({"best_distance": best, "username": "Anonymous"})
+
+@app.route("/api/sol-balance", methods=["GET"])
+def api_sol_balance():
+    wallet = request.args.get("wallet", "").strip()
+    if not wallet or len(wallet) < 32:
+        return jsonify({"error": "Invalid wallet"}), 400
+    
+    sol = get_sol_balance(wallet)
+    return jsonify({"wallet": wallet, "sol_balance": sol, "lamports": int(sol * 1_000_000_000)})
 
 @app.route("/setup-webhook")
 def setup_webhook():
