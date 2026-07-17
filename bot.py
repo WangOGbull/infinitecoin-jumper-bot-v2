@@ -24,7 +24,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # MongoDB
-from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 # Redis
@@ -129,6 +129,22 @@ def fix_duplicate_wallets():
             logger.info("Duplicate wallet migration complete: fixed %s records", fixed)
     except Exception as e:
         logger.error("Duplicate wallet migration failed: %s", e)
+
+    # FIX: Unset any wallet_address explicitly stored as null. A sparse unique
+    # index still indexes fields that are PRESENT with a null value (only
+    # truly-missing fields are skipped), so any player doc that has
+    # "wallet_address": null on it collides with every other such doc under
+    # the unique index. This clears the field entirely (making it absent)
+    # so the sparse index correctly excludes wallet-less players.
+    try:
+        result = db.players.update_many(
+            {"wallet_address": None},
+            {"$unset": {"wallet_address": "", "wallet_linked_at": "", "wallet_signature": ""}}
+        )
+        if result.modified_count:
+            logger.info("Cleared explicit-null wallet_address on %s player docs (index fix)", result.modified_count)
+    except Exception as e:
+        logger.error("Null wallet_address cleanup failed: %s", e)
 
 # ========== REDIS HELPERS ==========
 def _redis_key(prefix, identifier):
@@ -273,27 +289,37 @@ CORS(app, origins="*", supports_credentials=True)
 
 # ========== MONGO HELPERS ==========
 def get_or_create_player(uid):
+    """
+    Atomically fetch-or-create a player document.
+
+    IMPORTANT: this intentionally does NOT write "wallet_address": None on
+    creation. The unique index on wallet_address is `sparse`, and sparse
+    indexes only exclude documents where the field is entirely ABSENT --
+    a field explicitly set to null still gets indexed. Writing
+    wallet_address=null on every new player caused every player after the
+    first to collide on that null value and silently fail to be created,
+    which is why /start, /claim, /daily, /balance were failing while /play
+    (which never touches the DB) kept working.
+    """
     uid = str(uid)
-    player = db.players.find_one({"telegram_uid": uid})
-    if not player:
-        player = {
-            "telegram_uid": uid,
-            "wallet_address": None,
-            "wallet_linked_at": None,
-            "wallet_signature": None,
-            "total_earned": 0,
-            "unclaimed": 0,
-            "total_claimed": 0,
-            "is_holder": False,
-            "holder_checked_at": 0,
-            "created_at": int(time.time()),
-            "last_active": int(time.time())
-        }
-        try:
-            db.players.insert_one(player)
-        except DuplicateKeyError:
-            player = db.players.find_one({"telegram_uid": uid})
-        logger.info("New player created: uid=%s", uid)
+    now = int(time.time())
+    player = db.players.find_one_and_update(
+        {"telegram_uid": uid},
+        {
+            "$setOnInsert": {
+                "telegram_uid": uid,
+                "total_earned": 0,
+                "unclaimed": 0,
+                "total_claimed": 0,
+                "is_holder": False,
+                "holder_checked_at": 0,
+                "created_at": now,
+            },
+            "$set": {"last_active": now},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
     return player
 
 def audit_log(action, uid, wallet, details, ip=None):
@@ -944,6 +970,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.data == "wallet": await cmd_wallet(update, context)
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler so a bug in one handler never fails silently again."""
+    logger.error("Unhandled error while processing update %s: %s", update, context.error, exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "Something went wrong on our end. Please try again in a moment."
+            )
+    except Exception:
+        pass
+
 # ========== FLASK ROUTES ==========
 @app.route("/")
 def index():
@@ -1492,6 +1529,7 @@ async def _bot_main():
     telegram_app.add_handler(CommandHandler("daily", cmd_daily))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CallbackQueryHandler(on_callback))
+    telegram_app.add_error_handler(on_error)
     await telegram_app.initialize()
     await telegram_app.start()
     logger.info("Bot started")
