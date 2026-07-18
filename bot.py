@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import time
+import re
 import requests
 import asyncio
 import threading
@@ -99,6 +100,30 @@ def init_databases():
 
     # FIX: Remove duplicate wallet addresses from migration artifacts
     fix_duplicate_wallets()
+    # FIX: Remove "ghost" player records with no real identity that are
+    # squatting a wallet address (see fix_ghost_empty_uid_players below)
+    fix_ghost_empty_uid_players()
+
+def fix_ghost_empty_uid_players():
+    """Startup migration: an earlier bug allowed a player record with an
+    empty/invalid telegram_uid to get created and claim a wallet_address
+    (e.g. from testing the raw web link outside Telegram, before identity
+    resolution was made consistent). If a ghost record like that is still
+    holding onto a wallet, remove it so the real player's account can link
+    that wallet. Runs automatically on every startup -- no manual DB
+    editing needed."""
+    try:
+        ghosts = list(db.players.find({
+            "telegram_uid": {"$in": ["", "None"]},
+            "wallet_address": {"$ne": None}
+        }))
+        for g in ghosts:
+            db.players.delete_one({"_id": g["_id"]})
+            logger.warning("Removed ghost player squatting wallet=%s...", (g.get("wallet_address") or "")[:10])
+        if ghosts:
+            logger.info("Ghost player cleanup: removed %s record(s)", len(ghosts))
+    except Exception as e:
+        logger.error("Ghost player cleanup failed: %s", e)
 
 def fix_duplicate_wallets():
     """Startup migration: remove duplicate wallet addresses to prevent DuplicateKeyError."""
@@ -301,7 +326,9 @@ def get_or_create_player(uid):
     which is why /start, /claim, /daily, /balance were failing while /play
     (which never touches the DB) kept working.
     """
-    uid = str(uid)
+    uid = str(uid).strip()
+    if not uid or uid == "None":
+        return None
     now = int(time.time())
     player = db.players.find_one_and_update(
         {"telegram_uid": uid},
@@ -321,6 +348,47 @@ def get_or_create_player(uid):
         return_document=ReturnDocument.AFTER,
     )
     return player
+
+def _resolve_uid_from_payload(data):
+    """Safely extract telegram_user_id/user_id from a JSON payload.
+    Returns None if genuinely missing -- handles the case where the key is
+    present but explicitly null (which str(None) would otherwise turn into
+    the truthy-looking string "None")."""
+    uid = data.get("telegram_user_id")
+    if uid is None:
+        uid = data.get("user_id")
+    if uid is None:
+        return None
+    uid = str(uid).strip()
+    return uid or None
+
+def resolve_identity(data, wallet=None):
+    """
+    THE IDENTITY UNIFICATION POINT for the whole game.
+
+    Every API endpoint that touches a player record (wallet link, score
+    submit, claim, daily bonus, earnings sync) calls this instead of
+    trusting a client-supplied uid blindly.
+
+    The frontend's connector.resolveUserId() (index.html) is the single
+    source of truth on that side: it returns the real Telegram user id
+    when playing inside Telegram, or a deterministic id derived from the
+    wallet address ("w<hash>") when there's no Telegram context -- raw
+    web URL or a standalone (non-deep-linked) APK launch -- and it uses
+    that SAME value on every call. This function just needs to trust
+    whatever non-blank id arrives (that's what fixes the "wallet mismatch"
+    problem, since the frontend is now internally consistent) and only
+    falls back to deriving an id from the wallet address itself as a
+    last-resort safety net for any caller that sends neither -- this is
+    what prevents the original bug: a genuinely blank/missing id silently
+    creating a ghost record that squats someone's wallet.
+    """
+    raw_uid = _resolve_uid_from_payload(data)
+    if raw_uid:
+        return raw_uid
+    if wallet and len(wallet.strip()) >= 32:
+        return f"wallet:{wallet.strip()}"
+    return None
 
 def audit_log(action, uid, wallet, details, ip=None):
     db.audit_logs.insert_one({
@@ -387,8 +455,12 @@ def verify_wallet_signature(wallet, message, signature):
         logger.error("Signature verification error: %s", e)
         return False
 
-def generate_link_message(uid, wallet):
-    timestamp = int(time.time())
+def generate_link_message(uid, wallet, timestamp):
+    """IMPORTANT: timestamp must be the exact value the client embedded in
+    the message it signed. Regenerating a fresh timestamp here (as this
+    function used to do) means the reconstructed message almost never
+    matches what was actually signed, causing verification to fail even
+    for legitimate requests."""
     return f"Infinitecoin Jumper: Link wallet {wallet[:8]}... to Telegram {uid} at {timestamp}"
 
 # ========== HOLDER STATUS ==========
@@ -790,7 +862,7 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Too many attempts. Wait 5 minutes.")
         return
     
-    message = generate_link_message(uid, wallet)
+    message = generate_link_message(uid, wallet, int(time.time()))
     if not verify_wallet_signature(wallet, message, signature):
         await update.message.reply_text("Invalid signature. You must sign the link message with your wallet.")
         return
@@ -1022,6 +1094,8 @@ def api_status():
 @app.route("/api/user/<uid>", methods=["GET"])
 def api_get_user(uid):
     player = get_or_create_player(uid)
+    if not player:
+        return jsonify({"error": "Could not identify player"}), 400
     wallet = player.get("wallet_address", "")
     cap = get_daily_cap(wallet)
     claimed, _, _ = get_daily_claimed(wallet)
@@ -1075,23 +1149,36 @@ def wallet_callback():
 def api_wallet():
     data = request.get_json() or {}
     wallet = data.get("wallet_address", "").strip()
-    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     signature = data.get("signature", "").strip()
-    
-    logger.info("API /api/wallet uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
-    
-    if not wallet or not uid or len(wallet) < 32:
+
+    if not wallet or len(wallet) < 32:
         return jsonify({"error": "Invalid"}), 400
+
+    uid = resolve_identity(data, wallet=wallet)
+    if not uid:
+        return jsonify({"error": "Could not identify player"}), 400
+
+    logger.info("API /api/wallet uid=%s wallet=%s...", uid, wallet[:6] if wallet else "none")
+
+    timestamp = data.get("timestamp")
+    try:
+        timestamp = int(timestamp)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Missing or invalid timestamp"}), 400
+    if abs(int(time.time()) - timestamp) > 300:
+        return jsonify({"error": "Signature expired, please reconnect your wallet"}), 400
     
     allowed, _ = rate_limit_check(f"api_wallet:{uid}", max_requests=5, window_seconds=300)
     if not allowed:
         return jsonify({"error": "Too many attempts"}), 429
     
-    message = generate_link_message(uid, wallet)
+    message = generate_link_message(uid, wallet, timestamp)
     if not verify_wallet_signature(wallet, message, signature):
         return jsonify({"error": "Invalid signature"}), 403
     
     player = get_or_create_player(uid)
+    if not player:
+        return jsonify({"error": "Missing user identifier"}), 400
     existing_wallet = player.get("wallet_address")
     if existing_wallet:
         if existing_wallet.strip() == wallet:
@@ -1123,36 +1210,43 @@ def api_wallet():
 @app.route("/api/earnings", methods=["POST"])
 def api_earnings():
     data = request.get_json() or {}
-    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
+    wallet = data.get("wallet_address", "").strip()
     amount = int(data.get("amount", 0))
-    
+
+    uid = resolve_identity(data, wallet=wallet)
     if not uid:
         return jsonify({"error": "Missing user_id"}), 400
-    
+
     if amount <= 0 or amount > MAX_EARNINGS_PER_RUN:
         return jsonify({"error": f"Invalid amount. Max per run: {MAX_EARNINGS_PER_RUN}"}), 400
     
     allowed, _ = rate_limit_check(f"earnings:{uid}", max_requests=100, window_seconds=60)
     if not allowed:
         return jsonify({"error": "Rate limit exceeded"}), 429
-    
-    db.players.update_one(
+
+    # Ensure the player doc exists BEFORE incrementing -- doing this the
+    # other way around meant a brand new player's very first earnings
+    # sync silently did nothing, since $inc on a non-existent doc has no
+    # effect and the doc only got created afterward with zeroed fields.
+    get_or_create_player(uid)
+    player = db.players.find_one_and_update(
         {"telegram_uid": uid},
-        {"$inc": {"total_earned": amount, "unclaimed": amount}, "$set": {"last_active": int(time.time())}}
+        {"$inc": {"total_earned": amount, "unclaimed": amount}, "$set": {"last_active": int(time.time())}},
+        return_document=ReturnDocument.AFTER,
     )
-    
-    player = get_or_create_player(uid)
     audit_log("EARNINGS", uid, player.get("wallet_address"), {"amount": amount})
     return jsonify({"success": True, "unclaimed": player['unclaimed']})
 
 @app.route("/api/claim", methods=["POST"])
 def api_claim():
     data = request.get_json() or {}
-    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
-    
-    if not uid or not wallet:
+    if not wallet:
         return jsonify({"error": "Invalid"}), 400
+
+    uid = resolve_identity(data, wallet=wallet)
+    if not uid:
+        return jsonify({"error": "Could not identify player"}), 400
     
     allowed, _ = rate_limit_check(f"api_claim:{uid}", max_requests=10, window_seconds=60)
     if not allowed:
@@ -1224,9 +1318,9 @@ def api_claim():
 @app.route("/api/daily", methods=["POST"])
 def api_daily():
     data = request.get_json() or {}
-    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
     wallet = data.get("wallet_address", "").strip()
-    
+    uid = resolve_identity(data, wallet=wallet)
+
     if not uid:
         return jsonify({"error": "Missing"}), 400
     
@@ -1278,6 +1372,8 @@ def api_daily():
 @app.route("/api/balance/<uid>", methods=["GET"])
 def api_get_balance(uid):
     player = get_or_create_player(uid)
+    if not player:
+        return jsonify({"error": "Could not identify player"}), 400
     wallet = player.get("wallet_address", "")
     
     cap = get_daily_cap(wallet)
@@ -1314,10 +1410,13 @@ def api_score():
     wallet = data.get("wallet_address", "").strip()
     distance = int(data.get("distance", data.get("score", 0)))
     username = data.get("username", "Anonymous")
-    uid = str(data.get("telegram_user_id", data.get("user_id", "")))
-    
+
     if not wallet or len(wallet) < 32:
         return jsonify({"error": "Invalid wallet"}), 400
+
+    uid = resolve_identity(data, wallet=wallet)
+    if not uid:
+        return jsonify({"error": "Missing user identifier"}), 400
     if distance < 0:
         return jsonify({"error": "Invalid distance"}), 400
     
@@ -1327,6 +1426,8 @@ def api_score():
     
     # FIX: Auto-link wallet if player has no wallet linked yet
     player = get_or_create_player(uid)
+    if not player:
+        return jsonify({"error": "Missing user identifier"}), 400
     player_wallet = player.get("wallet_address")
 
     if not player_wallet:
